@@ -27,6 +27,8 @@ function Invoke-Persona([string[]]$PersonaArgs) {
 try {
     New-Item -ItemType Directory -Force -Path $source, $testCodex, $testBin | Out-Null
     Copy-Item -Path (Join-Path $root "*") -Destination $source -Recurse -Force
+    $copiedGit = Join-Path $source ".git"
+    if (Test-Path -LiteralPath $copiedGit) { Remove-Item -LiteralPath $copiedGit -Recurse -Force }
     & git -C $source init -b main *> $null
     & git -C $source add .
     & git -C $source -c user.name="Persona Test" -c user.email="persona-test@local" commit -m "test fixture" *> $null
