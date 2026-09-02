@@ -458,11 +458,11 @@ function Install-Persona {
             Set-State "path_added" "false"
         }
         Set-State "repo_root" $repo
-        if ($null -eq (Get-State "profile" $null)) { Set-State "profile" "economy" }
+        if (-not (Get-State "profile" "")) { Set-State "profile" "economy" }
         foreach ($persona in @("loop", "soul", "core")) {
             foreach ($field in @("model", "effort")) {
                 $key = "override_${persona}_${field}"
-                if ($null -eq (Get-State $key $null)) { Set-State $key "" }
+                if (-not (Get-State $key "")) { Set-State $key "" }
             }
         }
         Apply-Models
@@ -487,9 +487,9 @@ function Install-Persona {
     Info "설치가 완료되었습니다. 활성 프로필: $(Get-State 'profile')"
 }
 
-function Set-Profile([string[]]$Args) {
-    if ($Args.Count -ne 1 -or @("economy", "balanced", "max") -notcontains $Args[0]) { Fail "사용법: persona profile economy|balanced|max" }
-    $profile = $Args[0]
+function Set-Profile([string[]]$Arguments) {
+    if ($Arguments.Count -ne 1 -or @("economy", "balanced", "max") -notcontains $Arguments[0]) { Fail "사용법: persona profile economy|balanced|max" }
+    $profile = $Arguments[0]
     Invoke-WithStateRollback {
         Set-State "profile" $profile
         foreach ($persona in @("loop", "soul", "core")) {
@@ -501,14 +501,14 @@ function Set-Profile([string[]]$Args) {
     Info "프로필을 $profile 로 변경했습니다. 열린 작업의 모델은 데스크톱 UI에서 별도로 바꾸세요."
 }
 
-function Set-PersonaModel([string[]]$Args) {
-    if ($Args.Count -lt 1) { Fail "사용법: persona model set ... | persona model reset ..." }
-    if ($Args[0] -eq "set") {
-        if ($Args.Count -ne 4) { Fail "사용법: persona model set loop|soul|core luna|terra|sol <effort>" }
-        $persona = $Args[1]
+function Set-PersonaModel([string[]]$Arguments) {
+    if ($Arguments.Count -lt 1) { Fail "사용법: persona model set ... | persona model reset ..." }
+    if ($Arguments[0] -eq "set") {
+        if ($Arguments.Count -ne 4) { Fail "사용법: persona model set loop|soul|core luna|terra|sol <effort>" }
+        $persona = $Arguments[1]
         Assert-Persona $persona
-        $model = Normalize-Model $Args[2]
-        $effort = $Args[3]
+        $model = Normalize-Model $Arguments[2]
+        $effort = $Arguments[3]
         Assert-Effort $model $effort
         Invoke-WithStateRollback {
             Set-State "override_${persona}_model" $model
@@ -516,9 +516,9 @@ function Set-PersonaModel([string[]]$Args) {
             Apply-Models
         }
         Info "$persona 모델을 $model / $effort 로 재정의했습니다."
-    } elseif ($Args[0] -eq "reset") {
-        if ($Args.Count -ne 2) { Fail "사용법: persona model reset loop|soul|core" }
-        $persona = $Args[1]
+    } elseif ($Arguments[0] -eq "reset") {
+        if ($Arguments.Count -ne 2) { Fail "사용법: persona model reset loop|soul|core" }
+        $persona = $Arguments[1]
         Assert-Persona $persona
         Invoke-WithStateRollback {
             Set-State "override_${persona}_model" ""
@@ -574,9 +574,9 @@ function Get-AutoProjectId {
     return Get-MappedProject
 }
 
-function Set-Project([string[]]$Args) {
-    if ($Args.Count -ne 2 -or $Args[0] -ne "use") { Fail "사용법: persona project use <slug>" }
-    $slug = $Args[1]
+function Set-Project([string[]]$Arguments) {
+    if ($Arguments.Count -ne 2 -or $Arguments[0] -ne "use") { Fail "사용법: persona project use <slug>" }
+    $slug = $Arguments[1]
     if ($slug -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { Fail "프로젝트 slug 형식이 올바르지 않습니다." }
     $root = (& git rev-parse --show-toplevel 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $root) { $root = (Get-Location).Path }
@@ -616,9 +616,9 @@ function Get-MemorySummary([string]$Path) {
     return "승인된 기억"
 }
 
-function Show-Context([string[]]$Args) {
-    if ($Args.Count -ne 1) { Fail "사용법: persona context loop|soul|core" }
-    $persona = $Args[0]
+function Show-Context([string[]]$Arguments) {
+    if ($Arguments.Count -ne 1) { Fail "사용법: persona context loop|soul|core" }
+    $persona = $Arguments[0]
     Assert-Persona $persona
     $repo = Get-RepoRoot
     $projectId = Get-AutoProjectId
@@ -712,17 +712,17 @@ function Assert-PendingMemory([string]$Repo, [string]$ExpectedHash, [string]$Rel
     if ((Get-FileSha256 $path) -ne $ExpectedHash) { Fail "승인 뒤 변경된 기억은 다시 승인해야 합니다: $Relative" }
 }
 
-function Add-Memory([string[]]$Args) {
+function Add-Memory([string[]]$Arguments) {
     $scope = ""; $audience = ""; $summary = ""; $body = ""; $kind = "note"; $approved = $false
-    for ($i = 0; $i -lt $Args.Count; $i++) {
-        switch ($Args[$i]) {
-            "--scope" { if (++$i -ge $Args.Count) { Fail "--scope 값이 필요합니다." }; $scope = $Args[$i] }
-            "--audience" { if (++$i -ge $Args.Count) { Fail "--audience 값이 필요합니다." }; $audience = $Args[$i] }
-            "--summary" { if (++$i -ge $Args.Count) { Fail "--summary 값이 필요합니다." }; $summary = $Args[$i] }
-            "--text" { if (++$i -ge $Args.Count) { Fail "--text 값이 필요합니다." }; $body = $Args[$i] }
-            "--kind" { if (++$i -ge $Args.Count) { Fail "--kind 값이 필요합니다." }; $kind = $Args[$i] }
+    for ($i = 0; $i -lt $Arguments.Count; $i++) {
+        switch ($Arguments[$i]) {
+            "--scope" { if (++$i -ge $Arguments.Count) { Fail "--scope 값이 필요합니다." }; $scope = $Arguments[$i] }
+            "--audience" { if (++$i -ge $Arguments.Count) { Fail "--audience 값이 필요합니다." }; $audience = $Arguments[$i] }
+            "--summary" { if (++$i -ge $Arguments.Count) { Fail "--summary 값이 필요합니다." }; $summary = $Arguments[$i] }
+            "--text" { if (++$i -ge $Arguments.Count) { Fail "--text 값이 필요합니다." }; $body = $Arguments[$i] }
+            "--kind" { if (++$i -ge $Arguments.Count) { Fail "--kind 값이 필요합니다." }; $kind = $Arguments[$i] }
             "--approved" { $approved = $true }
-            default { Fail "알 수 없는 memory add 옵션입니다: $($Args[$i])" }
+            default { Fail "알 수 없는 memory add 옵션입니다: $($Arguments[$i])" }
         }
     }
     if (-not $approved) { Fail "창작자님의 명시적 승인 뒤 --approved를 지정해야 합니다." }
@@ -768,9 +768,9 @@ function Add-Memory([string[]]$Args) {
     Info "기억을 기록했습니다: $id"
 }
 
-function Retract-Memory([string[]]$Args) {
-    if ($Args.Count -ne 2 -or $Args[1] -ne "--approved") { Fail "사용법: persona memory retract <id> --approved" }
-    $id = $Args[0]
+function Retract-Memory([string[]]$Arguments) {
+    if ($Arguments.Count -ne 2 -or $Arguments[1] -ne "--approved") { Fail "사용법: persona memory retract <id> --approved" }
+    $id = $Arguments[0]
     if ($id -notmatch '^[A-Za-z0-9._:-]+$') { Fail "잘못된 기억 ID입니다." }
     $repo = Get-RepoRoot
     $original = Get-ChildItem -LiteralPath (Join-Path $repo "memory") -Filter "$id.md" -File -Recurse | Where-Object { $_.DirectoryName -notmatch '[\\/]retractions$' } | Select-Object -First 1
@@ -785,10 +785,10 @@ function Retract-Memory([string[]]$Args) {
     Info "기억을 활성 문맥에서 철회했습니다: $id"
 }
 
-function Manage-Memory([string[]]$Args) {
-    if ($Args.Count -lt 1) { Fail "사용법: persona memory add ... | persona memory retract ..." }
-    if ($Args[0] -eq "add") { Add-Memory @($Args | Select-Object -Skip 1) }
-    elseif ($Args[0] -eq "retract") { Retract-Memory @($Args | Select-Object -Skip 1) }
+function Manage-Memory([string[]]$Arguments) {
+    if ($Arguments.Count -lt 1) { Fail "사용법: persona memory add ... | persona memory retract ..." }
+    if ($Arguments[0] -eq "add") { Add-Memory @($Arguments | Select-Object -Skip 1) }
+    elseif ($Arguments[0] -eq "retract") { Retract-Memory @($Arguments | Select-Object -Skip 1) }
     else { Fail "사용법: persona memory add ... | persona memory retract ..." }
 }
 
