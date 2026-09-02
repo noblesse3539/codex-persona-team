@@ -19,7 +19,7 @@ function Read-Text([string]$Path) {
 function Invoke-Persona([string[]]$PersonaArgs) {
     Push-Location $source
     try {
-        & (Join-Path (Join-Path $source "scripts") "persona.ps1") @PersonaArgs
+        & pwsh -NoLogo -NoProfile -File (Join-Path (Join-Path $source "scripts") "persona.ps1") @PersonaArgs
         if ($LASTEXITCODE -ne 0) { throw "persona failed: $($PersonaArgs -join ' ')" }
     } finally { Pop-Location }
 }
