@@ -974,7 +974,7 @@ command_doctor() {
   repo="$(state_get repo_root 2>/dev/null || true)"
   if [[ -z "$repo" || ! -d "$repo/.git" ]]; then warn "Git 저장소 상태를 확인하세요: ${repo:-<unset>}"; failures=$((failures + 1)); fi
   if (( failures > 0 )); then
-    die "진단에서 $failures개 문제를 찾았습니다."
+    die "진단에서 ${failures}개 문제를 찾았습니다."
   fi
   info "진단을 통과했습니다."
 }

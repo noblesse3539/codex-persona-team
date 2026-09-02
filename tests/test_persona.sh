@@ -158,7 +158,7 @@ if (
   PERSONA_BIN_DIR="$TEST_BIN" \
   PERSONA_SKIP_PATH_UPDATE=1 \
   PERSONA_SKIP_CODEX_VALIDATE=0 \
-    "$SOURCE/scripts/persona.sh" profile max
+    "$SOURCE/scripts/persona.sh" profile economy
 ) >/dev/null 2>&1; then
   fail 'failed Codex validation was accepted'
 fi

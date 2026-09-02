@@ -462,7 +462,8 @@ function Install-Persona {
         Set-State "version" $PersonaVersion
     } catch {
         $reason = $_.Exception.Message
-        foreach ($target in @($targets | Select-Object -Reverse)) {
+        for ($index = $targets.Count - 1; $index -ge 0; $index--) {
+            $target = $targets[$index]
             Restore-InstallTarget $transaction $target.Name $target.Path
         }
         [Environment]::SetEnvironmentVariable("Path", $oldUserPath, "User")
@@ -898,7 +899,7 @@ function Invoke-Doctor {
     }
     $repo = Get-State "repo_root" ""
     if (-not $repo -or -not (Test-Path -LiteralPath (Join-Path $repo ".git"))) { Warn "Git 저장소 상태를 확인하세요: $repo"; $failures++ }
-    if ($failures -gt 0) { Fail "진단에서 $failures개 문제를 찾았습니다." }
+    if ($failures -gt 0) { Fail "진단에서 ${failures}개 문제를 찾았습니다." }
     Info "진단을 통과했습니다."
 }
 
