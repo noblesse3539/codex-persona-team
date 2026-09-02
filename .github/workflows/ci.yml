@@ -1,0 +1,44 @@
+name: Persona Team CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate shell syntax
+        run: bash -n scripts/persona.sh scripts/install.sh tests/test_persona.sh
+      - name: Validate templates
+        run: python3 tests/validate_repository.py
+      - name: Run macOS integration tests
+        run: ./tests/test_persona.sh
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate templates
+        run: python tests/validate_repository.py
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $allErrors = @()
+          foreach ($path in @("scripts/persona.ps1", "scripts/install.ps1", "tests/Test-Persona.ps1")) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD $path), [ref]$tokens, [ref]$parseErrors) | Out-Null
+            $allErrors += $parseErrors
+          }
+          if ($allErrors.Count) { $allErrors | Format-List; exit 1 }
+      - name: Run Windows integration tests
+        shell: pwsh
+        run: ./tests/Test-Persona.ps1
