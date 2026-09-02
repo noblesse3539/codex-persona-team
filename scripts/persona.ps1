@@ -51,7 +51,18 @@ $ProjectMap = Join-Path $StateDir "projects.tsv"
 
 function Move-AtomicFile([string]$Source, [string]$Destination) {
     if ([System.IO.File]::Exists($Destination)) {
-        [System.IO.File]::Replace($Source, $Destination, $null)
+        $directory = [System.IO.Path]::GetDirectoryName($Destination)
+        if (-not $directory) { $directory = (Get-Location).Path }
+        $backup = Join-Path $directory (".{0}.{1}.replace-backup" -f [System.IO.Path]::GetFileName($Destination), [Guid]::NewGuid().ToString("N"))
+        try {
+            [System.IO.File]::Replace($Source, $Destination, $backup)
+        } catch {
+            if (-not [System.IO.File]::Exists($Destination) -and [System.IO.File]::Exists($backup)) {
+                [System.IO.File]::Move($backup, $Destination)
+            }
+            throw
+        }
+        if ([System.IO.File]::Exists($backup)) { Remove-Item -LiteralPath $backup -Force }
     } else {
         [System.IO.File]::Move($Source, $Destination)
     }
@@ -886,7 +897,10 @@ function Invoke-Doctor {
             & codex --strict-config --version *> $null
             if ($LASTEXITCODE -ne 0) { Warn "config.toml 엄격 검증 실패"; $failures++ }
         }
-    } else { Warn "codex 명령을 PATH에서 찾지 못했습니다."; $failures++ }
+    } else {
+        Warn "codex 명령을 PATH에서 찾지 못했습니다."
+        if ($env:PERSONA_SKIP_CODEX_VALIDATE -ne "1") { $failures++ }
+    }
     $agentsPath = Join-Path $CodexDir "AGENTS.md"
     $agentText = if (Test-Path -LiteralPath $agentsPath) { [System.IO.File]::ReadAllText($agentsPath, $Utf8NoBom) } else { "" }
     if (([regex]::Matches($agentText, [regex]::Escape($AgentsStart))).Count -ne 1) { Warn "전역 AGENTS 관리 블록 개수가 1이 아닙니다."; $failures++ }

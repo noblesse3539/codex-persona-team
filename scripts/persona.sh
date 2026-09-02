@@ -964,7 +964,9 @@ command_doctor() {
     fi
   else
     warn "codex 명령을 PATH에서 찾지 못했습니다."
-    failures=$((failures + 1))
+    if [[ "${PERSONA_SKIP_CODEX_VALIDATE:-0}" != "1" ]]; then
+      failures=$((failures + 1))
+    fi
   fi
   marker_count="$(grep -Fc "$AGENTS_START" "$CODEX_DIR/AGENTS.md" 2>/dev/null || true)"
   if [[ "$marker_count" != "1" ]]; then warn "전역 AGENTS 관리 블록 개수가 1이 아닙니다."; failures=$((failures + 1)); fi
