@@ -1006,3 +1006,7 @@ try {
     [Console]::Error.WriteLine($_.Exception.Message)
     exit 1
 }
+
+# Native-command exit codes persist across script invocations in PowerShell.
+# Report a clean status after every successfully handled persona command.
+$global:LASTEXITCODE = 0
