@@ -555,7 +555,7 @@ function Get-MappedProject {
     foreach ($line in [System.IO.File]::ReadAllLines($ProjectMap, $Utf8NoBom)) {
         $parts = $line -split "`t", 2
         if ($parts.Count -ne 2) { continue }
-        $path = $parts[0].TrimEnd('\', '/')
+        $path = [System.IO.Path]::GetFullPath($parts[0]).TrimEnd('\', '/')
         if ($here -eq $path -or $here.StartsWith($path + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
             if ($path.Length -gt $bestLength) { $best = $parts[1]; $bestLength = $path.Length }
         }
@@ -580,7 +580,7 @@ function Set-Project([string[]]$Arguments) {
     if ($slug -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { Fail "프로젝트 slug 형식이 올바르지 않습니다." }
     $root = (& git rev-parse --show-toplevel 2>$null)
     if ($LASTEXITCODE -ne 0 -or -not $root) { $root = (Get-Location).Path }
-    $root = ($root | Select-Object -First 1).TrimEnd('\', '/')
+    $root = [System.IO.Path]::GetFullPath(($root | Select-Object -First 1)).TrimEnd('\', '/')
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
     $lines = New-Object System.Collections.Generic.List[string]
     if (Test-Path -LiteralPath $ProjectMap) {
