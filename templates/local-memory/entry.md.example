@@ -1,0 +1,13 @@
+---
+id: "20260906T000000Z-00000000-0000-0000-0000-000000000000"
+created_at: "20260906T000000Z"
+scope: "global-local"
+audience: "shared"
+kind: "preference"
+summary: "A short creator-approved preference"
+approved_by: "creator"
+evidence: "creator"
+status: "active"
+---
+
+This is schema-only example text. Never place a real creator profile in the Persona source repository.

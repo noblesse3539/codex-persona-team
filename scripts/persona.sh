@@ -3,7 +3,8 @@
 
 set -euo pipefail
 
-PERSONA_VERSION="1.0.0"
+PERSONA_VERSION="2.0.0"
+PERSONA_SCHEMA_VERSION="2"
 AGENTS_START="<!-- LOOP-PERSONA-TEAM:START -->"
 AGENTS_END="<!-- LOOP-PERSONA-TEAM:END -->"
 PATH_START="# LOOP-PERSONA-TEAM:PATH:START"
@@ -43,19 +44,103 @@ persona_bin_dir() {
 }
 
 CODEX_DIR="$(persona_codex_dir)"
-STATE_DIR="$CODEX_DIR/persona-team"
+PERSONA_ROOT="$CODEX_DIR/persona-team"
+PRIVATE_DIR="$PERSONA_ROOT/private"
+STATE_DIR="$PERSONA_ROOT/state"
 STATE_FILE="$STATE_DIR/state.conf"
-BACKUP_DIR="$STATE_DIR/backups"
-PENDING_FILE="$STATE_DIR/pending-memory.txt"
-PROJECT_MAP="$STATE_DIR/projects.tsv"
+LEGACY_STATE_FILE="$PERSONA_ROOT/state.conf"
+LEGACY_PROJECT_MAP="$PERSONA_ROOT/projects.tsv"
+BACKUP_DIR="$PERSONA_ROOT/backups"
+PENDING_DIR="$PERSONA_ROOT/pending"
+SHARED_MEMORY_DIR="$PRIVATE_DIR/shared/entries"
+JOURNAL_DIR="$PRIVATE_DIR/journals"
+CAPSULE_DIR="$PRIVATE_DIR/capsules"
+RETRACTION_DIR="$PRIVATE_DIR/retractions"
+PRIVATE_INDEX_DIR="$PRIVATE_DIR/indexes"
+PROJECT_STATE_DIR="$STATE_DIR/projects"
+PROJECT_MAP="$PROJECT_STATE_DIR/paths.tsv"
+TASK_BINDING_DIR="$STATE_DIR/task-bindings"
+CURSOR_DIR="$STATE_DIR/cursors"
+WRITER_LOCK_DIR="$STATE_DIR/writer-locks"
+MODEL_OVERRIDE_DIR="$STATE_DIR/model-overrides"
+HANDOFF_DIR="$PENDING_DIR/handoffs"
+MEETING_DRAFT_DIR="$PENDING_DIR/meetings"
+ROOT_MARKER="$PERSONA_ROOT/.persona-team-root"
+PRIVATE_MARKER="$PRIVATE_DIR/.persona-private-data"
 
 timestamp() {
   date -u '+%Y%m%dT%H%M%SZ'
 }
 
+platform_name() {
+  if [[ -n "${PERSONA_TEST_UNAME:-}" ]]; then
+    printf '%s\n' "$PERSONA_TEST_UNAME"
+  else
+    uname -s
+  fi
+}
+
+require_macos() {
+  [[ "$(platform_name)" == "Darwin" ]] \
+    || die "Persona Team v2는 macOS에서만 실행할 수 있습니다."
+}
+
+new_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  else
+    printf '%s-%s-%s' "$(timestamp)" "$$" "$RANDOM" | hash_text
+  fi
+}
+
+chmod_private_tree() {
+  [[ -d "$PERSONA_ROOT" ]] || return 0
+  find "$PERSONA_ROOT" -type d -exec chmod 700 {} + 2>/dev/null || true
+  find "$PRIVATE_DIR" "$STATE_DIR" "$PENDING_DIR" "$BACKUP_DIR" -type f -exec chmod 600 {} + 2>/dev/null || true
+}
+
+create_local_layout() {
+  local install_id root_physical tmp
+  [[ ! -L "$PERSONA_ROOT" ]] || die "Persona 로컬 루트가 심볼릭 링크라서 사용할 수 없습니다: $PERSONA_ROOT"
+  mkdir -p "$SHARED_MEMORY_DIR" "$JOURNAL_DIR/loop" "$JOURNAL_DIR/soul" "$JOURNAL_DIR/core" \
+    "$CAPSULE_DIR" "$RETRACTION_DIR" "$PRIVATE_INDEX_DIR" "$PROJECT_STATE_DIR" \
+    "$TASK_BINDING_DIR" "$CURSOR_DIR" "$WRITER_LOCK_DIR" "$MODEL_OVERRIDE_DIR" "$HANDOFF_DIR" "$MEETING_DRAFT_DIR" "$BACKUP_DIR"
+
+  if [[ ! -f "$STATE_FILE" && -f "$LEGACY_STATE_FILE" && ! -L "$LEGACY_STATE_FILE" ]]; then
+    cp -p "$LEGACY_STATE_FILE" "$STATE_FILE"
+  fi
+  if [[ ! -f "$PROJECT_MAP" && -f "$LEGACY_PROJECT_MAP" && ! -L "$LEGACY_PROJECT_MAP" ]]; then
+    cp -p "$LEGACY_PROJECT_MAP" "$PROJECT_MAP"
+  fi
+
+  install_id="$(state_get install_id 2>/dev/null || true)"
+  if [[ -z "$install_id" ]]; then
+    install_id="$(new_uuid)"
+    state_set install_id "$install_id"
+  fi
+  root_physical="$(cd "$PERSONA_ROOT" && pwd -P)"
+  tmp="$(mktemp "$PERSONA_ROOT/.root-marker.XXXXXX")"
+  {
+    printf 'schema_version=%s\n' "$PERSONA_SCHEMA_VERSION"
+    printf 'install_id=%s\n' "$install_id"
+    printf 'root=%s\n' "$root_physical"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ROOT_MARKER"
+  tmp="$(mktemp "$PRIVATE_DIR/.private-marker.XXXXXX")"
+  {
+    printf 'schema_version=%s\n' "$PERSONA_SCHEMA_VERSION"
+    printf 'install_id=%s\n' "$install_id"
+  } > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$PRIVATE_MARKER"
+  chmod_private_tree
+}
+
 state_get() {
-  local key="$1"
-  [[ -f "$STATE_FILE" ]] || return 1
+  local key="$1" source="$STATE_FILE"
+  if [[ ! -f "$source" && -f "$LEGACY_STATE_FILE" ]]; then source="$LEGACY_STATE_FILE"; fi
+  [[ -f "$source" && ! -L "$source" ]] || return 1
   awk -v wanted="$key" '
     index($0, wanted "=") == 1 {
       print substr($0, length(wanted) + 2)
@@ -63,7 +148,7 @@ state_get() {
       exit
     }
     END { if (!found) exit 1 }
-  ' "$STATE_FILE"
+  ' "$source"
 }
 
 state_set() {
@@ -72,6 +157,7 @@ state_set() {
   local tmp
   [[ "$key" =~ ^[a-z0-9_]+$ ]] || die "잘못된 상태 키입니다: $key"
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "상태 값에는 줄바꿈을 넣을 수 없습니다."
+  [[ ! -L "$STATE_DIR" && ! -L "$STATE_FILE" ]] || die "Persona 상태 경로가 심볼릭 링크입니다."
   mkdir -p "$STATE_DIR"
   tmp="$(mktemp "$STATE_DIR/.state.XXXXXX")"
   if [[ -f "$STATE_FILE" ]]; then
@@ -245,6 +331,19 @@ render_agent() {
   mv "$tmp" "$target"
 }
 
+write_model_state_snapshot() {
+  local persona profile model effort source tmp target
+  profile="$(state_get profile 2>/dev/null || printf economy)"
+  mkdir -p "$MODEL_OVERRIDE_DIR"
+  for persona in loop soul core; do
+    model="$(effective_value "$persona" model)"; effort="$(effective_value "$persona" effort)"
+    if [[ -n "$(state_get "override_${persona}_model" 2>/dev/null || true)" ]]; then source="local-override"; else source="profile-$profile"; fi
+    target="$MODEL_OVERRIDE_DIR/$persona.conf"; tmp="$(mktemp "$MODEL_OVERRIDE_DIR/.$persona.XXXXXX")"
+    printf 'profile=%s\nmodel=%s\neffort=%s\nsource=%s\n' "$profile" "$model" "$effort" "$source" > "$tmp"
+    chmod 600 "$tmp"; mv "$tmp" "$target"
+  done
+}
+
 apply_models() {
   local repo loop_model loop_effort soul_model soul_effort core_model core_effort
   repo="$(resolve_repo_root)"
@@ -260,6 +359,7 @@ apply_models() {
   render_agent "$repo" core "$core_model" "$core_effort"
   state_set last_written_loop_model "$loop_model"
   state_set last_written_loop_effort "$loop_effort"
+  write_model_state_snapshot
 }
 
 strip_managed_block() {
@@ -430,7 +530,12 @@ restore_install_target() {
 
 command_install() {
   local repo config original_model original_effort installed_state transaction install_status shell_rc=""
+  require_macos
+  validate_local_destination_precreate
   repo="$(resolve_repo_root)"
+  create_local_layout
+  validate_local_layout
+  migrate_v1_memory_once
   check_install_conflicts
   mkdir -p "$STATE_DIR" "$BACKUP_DIR"
   config="$CODEX_DIR/config.toml"
@@ -485,6 +590,9 @@ command_install() {
     die "설치에 실패해 관리 대상 파일을 이전 상태로 복구했습니다."
   fi
   rm -rf -- "$transaction"
+  rm -f -- "$LEGACY_STATE_FILE" "$LEGACY_PROJECT_MAP" "$PERSONA_ROOT/pending-memory.txt"
+  if [[ "${PERSONA_SKIP_PENDING_CLEANUP:-0}" != "1" ]]; then cleanup_expired_pending; fi
+  chmod_private_tree
   info "설치가 완료되었습니다. 활성 프로필: $(state_get profile)"
   if [[ ":$PATH:" != *":$(persona_bin_dir):"* ]]; then
     info "새 터미널을 열면 persona 명령을 사용할 수 있습니다."
@@ -576,193 +684,517 @@ hash_file() {
   fi
 }
 
-normalize_remote() {
-  local remote="$1"
-  remote="${remote%.git}"
-  remote="${remote%/}"
-  remote="$(printf '%s' "$remote" | sed -E 's#^[a-zA-Z]+://([^/@]+@)?##; s#^git@([^:]+):#\1/#' | tr '[:upper:]' '[:lower:]')"
-  printf '%s\n' "$remote"
+hash_stream_full() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 | awk '{print $NF}'
+  else
+    die "무결성 검사에 필요한 SHA-256 도구를 찾지 못했습니다."
+  fi
 }
 
-mapped_project() {
-  local here line path slug best="" best_len=0
-  here="$(pwd -P)"
-  [[ -f "$PROJECT_MAP" ]] || return 1
-  while IFS=$'\t' read -r path slug; do
-    [[ -n "$path" && -n "$slug" ]] || continue
-    case "$here/" in
-      "$path/"*)
-        if (( ${#path} > best_len )); then best="$slug"; best_len=${#path}; fi
-        ;;
+document_seal_hash() {
+  local file="$1"
+  awk '!/^sealed_sha256:[[:space:]]*/ { print }' "$file" | hash_stream_full
+}
+
+copy_private_file_once() {
+  local source="$1" target="$2"
+  [[ -f "$source" && ! -L "$source" ]] || return 1
+  mkdir -p "$(dirname "$target")"
+  if [[ -e "$target" ]]; then
+    if cmp -s "$source" "$target"; then return 0; fi
+    warn "같은 이름의 로컬 기억이 이미 있어 v1 파일을 건너뜁니다: $target"
+    return 1
+  fi
+  cp -p "$source" "$target"
+  chmod 600 "$target"
+}
+
+migrate_v1_memory_from() {
+  local legacy_repo="$1" migrated=0 file relative target report legacy_id
+  [[ -n "$legacy_repo" && -d "$legacy_repo/memory" && ! -L "$legacy_repo/memory" ]] || return 1
+
+  if [[ -f "$legacy_repo/memory/global/shared/profile.md" ]]; then
+    if copy_private_file_once "$legacy_repo/memory/global/shared/profile.md" "$PRIVATE_DIR/shared/profile.md"; then
+      migrated=$((migrated + 1))
+    fi
+  fi
+  for file in \
+    "$legacy_repo"/memory/global/shared/entries/*.md \
+    "$legacy_repo"/memory/global/journals/loop/*.md \
+    "$legacy_repo"/memory/global/journals/soul/*.md \
+    "$legacy_repo"/memory/global/journals/core/*.md \
+    "$legacy_repo"/memory/retractions/*.md; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    relative="${file#"$legacy_repo/memory/"}"
+    case "$relative" in
+      global/shared/entries/*) target="$SHARED_MEMORY_DIR/${file##*/}" ;;
+      global/journals/loop/*) target="$JOURNAL_DIR/loop/${file##*/}" ;;
+      global/journals/soul/*) target="$JOURNAL_DIR/soul/${file##*/}" ;;
+      global/journals/core/*) target="$JOURNAL_DIR/core/${file##*/}" ;;
+      retractions/*) target="$RETRACTION_DIR/${file##*/}" ;;
+      *) continue ;;
     esac
-  done < "$PROJECT_MAP"
-  [[ -n "$best" ]] || return 1
-  printf '%s\n' "$best"
-}
-
-auto_project_id() {
-  local remote normalized slug digest
-  if remote="$(git remote get-url origin 2>/dev/null)"; then
-    normalized="$(normalize_remote "$remote")"
-    slug="$(basename "$normalized" | tr -cd '[:alnum:]._-')"
-    slug="$(printf '%s' "${slug:-project}" | tr '[:upper:]' '[:lower:]')"
-    digest="$(printf '%s' "$normalized" | hash_text)"
-    printf '%s-%s\n' "$slug" "$digest"
-    return 0
-  fi
-  mapped_project
-}
-
-command_project() {
-  local action="${1:-}" slug="${2:-}" root tmp
-  [[ "$action" == "use" && $# -eq 2 ]] || die "사용법: persona project use <slug>"
-  [[ "$slug" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "프로젝트 slug는 영문자나 숫자로 시작하고 영문자, 숫자, 점, 밑줄, 하이픈만 사용할 수 있습니다."
-  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
-  mkdir -p "$STATE_DIR"
-  tmp="$(mktemp "$STATE_DIR/.projects.XXXXXX")"
-  if [[ -f "$PROJECT_MAP" ]]; then
-    awk -F '\t' -v wanted="$root" '$1 != wanted { print }' "$PROJECT_MAP" > "$tmp"
-  fi
-  printf '%s\t%s\n' "$root" "$slug" >> "$tmp"
-  mv "$tmp" "$PROJECT_MAP"
-  info "현재 프로젝트를 $slug 로 연결했습니다."
-}
-
-memory_is_retracted() {
-  local repo="$1" id="$2"
-  [[ -f "$repo/memory/retractions/$id.md" ]]
-}
-
-memory_summary() {
-  local file="$1"
-  awk -F ': ' '$1 == "summary" { line=substr($0, index($0, ":")+2); gsub(/^\"|\"$/, "", line); print line; exit }' "$file"
-}
-
-memory_id() {
-  local file="$1"
-  basename "$file" .md
-}
-
-collect_memory_files() {
-  local repo="$1" persona="$2" project_id="${3:-}" dir
-  for dir in \
-    "$repo/memory/global/shared/entries" \
-    "$repo/memory/global/journals/$persona"; do
-    [[ -d "$dir" ]] && find "$dir" -maxdepth 1 -type f -name '*.md' -print
+    if copy_private_file_once "$file" "$target"; then migrated=$((migrated + 1)); fi
   done
-  if [[ -n "$project_id" ]]; then
-    for dir in \
-      "$repo/memory/projects/$project_id/shared" \
-      "$repo/memory/projects/$project_id/journals/$persona"; do
-      [[ -d "$dir" ]] && find "$dir" -maxdepth 1 -type f -name '*.md' -print
-    done
+
+  report="$STATE_DIR/v1-project-memory-report.txt"
+  if [[ -d "$legacy_repo/memory/projects" ]]; then
+    : > "$report"
+    while IFS= read -r file; do
+      legacy_id="$(frontmatter_value "$file" id 2>/dev/null || printf unknown)"
+      printf '%s\t%s\n' "$legacy_id" "$file" >> "$report"
+    done < <(find "$legacy_repo/memory/projects" -type f -name '*.md' -print 2>/dev/null | sort)
+    chmod 600 "$report"
   fi
+  if (( migrated > 0 )); then info "v1 전역 기억 ${migrated}개를 이 Mac의 로컬 저장소로 이전했습니다."; fi
   return 0
 }
 
-command_context() {
-  local persona="${1:-}" repo project_id="" list_file active_file file id summary count=0
-  [[ $# -eq 1 ]] || die "사용법: persona context loop|soul|core"
-  validate_persona "$persona"
-  repo="$(resolve_repo_root)"
-  project_id="$(auto_project_id 2>/dev/null || true)"
-  printf '# Persona canonical context\n\n'
-  cat "$repo/canon/team.md"
-  printf '\n'
-  cat "$repo/canon/$persona.md"
-  printf '\n'
-  cat "$repo/memory/global/shared/profile.md"
-  if [[ -n "$project_id" ]]; then
-    printf '\n## Current project\n\n- id: `%s`\n' "$project_id"
-    if [[ -f "$repo/memory/projects/$project_id/shared/profile.md" ]]; then
-      printf '\n'
-      cat "$repo/memory/projects/$project_id/shared/profile.md"
-    fi
-  fi
+migrate_v1_memory_once() {
+  local marker="$STATE_DIR/v1-memory-migrated" legacy_repo current_repo
+  [[ ! -f "$marker" ]] || return 0
+  legacy_repo="$(state_get repo_root 2>/dev/null || true)"
+  current_repo="$(resolve_repo_root)"
+  migrate_v1_memory_from "$legacy_repo" || true
+  if [[ "$current_repo" != "$legacy_repo" ]]; then migrate_v1_memory_from "$current_repo" || true; fi
+  {
+    printf 'migrated_at=%s\n' "$(timestamp)"
+    printf 'legacy_repo=%s\n' "$legacy_repo"
+  } > "$marker"
+  chmod 600 "$marker"
+  rebuild_private_indexes
+}
 
-  list_file="$(mktemp "${TMPDIR:-/tmp}/persona-memory-list.XXXXXX")"
-  active_file="$(mktemp "${TMPDIR:-/tmp}/persona-memory-active.XXXXXX")"
-  collect_memory_files "$repo" "$persona" "$project_id" | sort > "$list_file"
-  while IFS= read -r file; do
-    [[ -f "$file" ]] || continue
-    id="$(memory_id "$file")"
-    if ! memory_is_retracted "$repo" "$id"; then printf '%s\n' "$file" >> "$active_file"; fi
-  done < "$list_file"
-  rm -f "$list_file"
+cleanup_expired_pending() {
+  local dir
+  for dir in "$HANDOFF_DIR" "$MEETING_DRAFT_DIR"; do
+    [[ -d "$dir" && ! -L "$dir" ]] || continue
+    find "$dir" -type f -name '*.md' -mtime +30 -delete 2>/dev/null || true
+  done
+}
 
-  if [[ -s "$active_file" ]]; then
-    printf '\n## Active memory index\n\n'
-    while IFS= read -r file; do
-      id="$(memory_id "$file")"
-      summary="$(memory_summary "$file")"
-      printf -- '- `%s`: %s\n' "$id" "${summary:-승인된 기억}"
-      count=$((count + 1))
-    done < "$active_file"
-    printf '\n## Recent memory details\n'
-    tail -n 8 "$active_file" | while IFS= read -r file; do
-      printf '\n'
-      cat "$file"
-    done
+path_is_within() {
+  local child="$1" parent="$2"
+  case "$child/" in "$parent/"*) return 0 ;; *) return 1 ;; esac
+}
+
+path_has_symlink_component() {
+  local path="$1" current="/" part
+  [[ "$path" == /* ]] || return 0
+  path="${path#/}"
+  IFS='/' read -r -a parts <<< "$path"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" ]] || continue
+    if [[ "$current" == "/" ]]; then current="/$part"; else current="$current/$part"; fi
+    [[ ! -L "$current" ]] || return 0
+  done
+  return 1
+}
+
+validate_local_destination_precreate() {
+  local probe containing_git
+  [[ "$CODEX_DIR" == /* && "$PERSONA_ROOT" == /* ]] || die "Persona 설치 경로는 절대 경로여야 합니다."
+  case "$PERSONA_ROOT" in */../*|*/./*|/|"$HOME"|"$CODEX_DIR") die "Persona 설치 경로 범위가 안전하지 않습니다: $PERSONA_ROOT" ;; esac
+  if path_has_symlink_component "$PERSONA_ROOT"; then
+    die "Persona 로컬 경로가 심볼릭 링크를 통과합니다: $PERSONA_ROOT"
   fi
-  rm -f "$active_file"
+  probe="$CODEX_DIR"
+  while [[ ! -d "$probe" ]]; do
+    [[ "$probe" != "/" ]] || break
+    probe="$(dirname "$probe")"
+  done
+  containing_git="$(git -C "$probe" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$containing_git" ]] && path_is_within "$PERSONA_ROOT" "$(cd "$containing_git" && pwd -P)"; then
+    die "Persona 로컬 데이터는 Git 작업 트리 안에 설치할 수 없습니다: $PERSONA_ROOT"
+  fi
+}
+
+validate_local_layout() {
+  local expected_root actual_root install_id marker_id private_marker_id marker_root repo containing_git
+  [[ -d "$PERSONA_ROOT" && ! -L "$PERSONA_ROOT" ]] || die "Persona 전용 로컬 루트가 없거나 심볼릭 링크입니다: $PERSONA_ROOT"
+  if path_has_symlink_component "$PERSONA_ROOT"; then
+    die "Persona 로컬 경로가 심볼릭 링크를 통과합니다: $PERSONA_ROOT"
+  fi
+  [[ -f "$ROOT_MARKER" && ! -L "$ROOT_MARKER" && -f "$PRIVATE_MARKER" && ! -L "$PRIVATE_MARKER" ]] \
+    || die "Persona 전용 로컬 데이터 식별 마커가 없습니다."
+  expected_root="$(cd "$CODEX_DIR" && pwd -P)/persona-team"
+  actual_root="$(cd "$PERSONA_ROOT" && pwd -P)"
+  [[ "$actual_root" == "$expected_root" && "$actual_root" != "/" && "$actual_root" != "$HOME" && "$actual_root" != "$(cd "$CODEX_DIR" && pwd -P)" ]] \
+    || die "Persona 로컬 루트 경로가 안전하지 않습니다: $actual_root"
+  install_id="$(state_get install_id 2>/dev/null || true)"
+  marker_id="$(awk -F= '$1=="install_id" {print substr($0,index($0,"=")+1); exit}' "$ROOT_MARKER")"
+  private_marker_id="$(awk -F= '$1=="install_id" {print substr($0,index($0,"=")+1); exit}' "$PRIVATE_MARKER")"
+  marker_root="$(awk -F= '$1=="root" {print substr($0,index($0,"=")+1); exit}' "$ROOT_MARKER")"
+  [[ -n "$install_id" && "$marker_id" == "$install_id" && "$private_marker_id" == "$install_id" && "$marker_root" == "$actual_root" ]] \
+    || die "Persona 로컬 데이터의 설치 식별자가 일치하지 않습니다."
+  containing_git="$(git -C "$actual_root" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$containing_git" ]] && path_is_within "$actual_root" "$(cd "$containing_git" && pwd -P)"; then
+    die "Persona 로컬 데이터가 Git 작업 트리 안에 있습니다: $actual_root"
+  fi
+  for repo in "$(resolve_repo_root 2>/dev/null || true)" "$(git rev-parse --show-toplevel 2>/dev/null || true)"; do
+    [[ -z "$repo" ]] && continue
+    repo="$(cd "$repo" && pwd -P)"
+    if path_is_within "$actual_root" "$repo"; then die "Persona 로컬 데이터가 Git 작업 트리 안에 있습니다: $actual_root"; fi
+  done
+}
+
+yaml_escape() {
+  printf '%s' "$1" | tr '\r\n\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 contains_secret() {
   LC_ALL=C grep -Eqi '(BEGIN[[:space:]].*PRIVATE KEY|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|session[_ -]?cookie|password[[:space:]]*[:=]|secret[[:space:]]*[:=]|recovery[_ -]?code|sk-[A-Za-z0-9_-]{12,}|비밀번호[[:space:]]*[:=]|API[[:space:]]*키[[:space:]]*[:=]|(접근|갱신)?[[:space:]]*토큰[[:space:]]*[:=]|개인[[:space:]]*키[[:space:]]*[:=]|복구[[:space:]]*코드[[:space:]]*[:=])'
 }
 
-pending_add() {
-  local repo="$1" file="$2" relative digest tmp
-  relative="${file#"$repo/"}"
-  digest="$(hash_file "$file")"
-  mkdir -p "$STATE_DIR"
-  tmp="$(mktemp "$STATE_DIR/.pending-memory.XXXXXX")"
-  if [[ -f "$PENDING_FILE" ]]; then
-    awk -F '\t' -v wanted="$relative" 'NF < 2 || $2 != wanted { print }' "$PENDING_FILE" > "$tmp"
+contains_sensitive_inference() {
+  LC_ALL=C grep -Eqi '((정치|종교|성적[[:space:]]*지향|인종|민족|건강|장애|정신[[:space:]]*질환|노조|범죄|유전)[^\n]{0,30}(성향|같다|보인다|추정|추측|일[[:space:]]*것)|(political|religious|sexual orientation|ethnicity|race|health condition|disability|mental illness|union|criminal|genetic)[^\n]{0,40}(infer|likely|seems|probably))'
+}
+
+contains_local_project_metadata() {
+  LC_ALL=C grep -Eqi '(/Users/[^ /]+/|/private/var/|/var/folders/|/home/[^ /]+/|~/?\.codex/|codex://|(^|[^A-Za-z])(thread|task|host)[_ -]?id[[:space:]]*:|^[[:space:]]*model(_reasoning_effort)?[[:space:]]*:)'
+}
+
+frontmatter_value() {
+  local file="$1" key="$2"
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  awk -v wanted="$key" '
+    NR == 1 && $0 != "---" { exit 2 }
+    NR > 1 && $0 == "---" { exit }
+    NR > 1 && index($0, wanted ":") == 1 {
+      value=substr($0, length(wanted) + 2)
+      sub(/^[[:space:]]*/, "", value)
+      gsub(/^"|"$/, "", value)
+      print value
+      found=1
+      exit
+    }
+    END { if (!found) exit 1 }
+  ' "$file"
+}
+
+validate_project_id() {
+  [[ "$1" =~ ^project-[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "안전하지 않은 프로젝트 ID입니다: $1"
+}
+
+project_root() {
+  local root
+  root="$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)"
+  (cd "$root" && pwd -P)
+}
+
+validate_docs_relative_path() {
+  local value="$1" part
+  [[ -n "$value" && "$value" != /* && "$value" != "." && "$value" != */ ]] \
+    || die "프로젝트 문서 경로는 프로젝트 안의 상대경로여야 합니다."
+  [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || die "프로젝트 문서 경로에는 영문자, 숫자, 점, 밑줄, 하이픈과 슬래시만 사용할 수 있습니다."
+  IFS='/' read -r -a parts <<< "$value"
+  for part in "${parts[@]}"; do [[ -n "$part" && "$part" != "." && "$part" != ".." ]] || die "안전하지 않은 프로젝트 문서 경로입니다."; done
+}
+
+mapped_project_line() {
+  local here root id rel name best="" best_len=0
+  here="$(pwd -P)"
+  [[ -f "$PROJECT_MAP" && ! -L "$PROJECT_MAP" ]] || return 1
+  while IFS=$'\t' read -r root id rel name; do
+    [[ -n "$root" && -n "$id" && -n "$rel" ]] || continue
+    case "$here/" in
+      "$root/"*) if (( ${#root} > best_len )); then best="$root"$'\t'"$id"$'\t'"$rel"$'\t'"$name"; best_len=${#root}; fi ;;
+    esac
+  done < "$PROJECT_MAP"
+  [[ -n "$best" ]] || return 1
+  printf '%s\n' "$best"
+}
+
+current_project_docs() {
+  local line root id rel name manifest
+  if line="$(mapped_project_line 2>/dev/null)"; then
+    IFS=$'\t' read -r root id rel name <<< "$line"
+    manifest="$root/$rel/project.md"
+    if [[ -f "$manifest" && "$(frontmatter_value "$manifest" id 2>/dev/null || true)" == "$id" ]]; then
+      validate_project_id "$id"
+      printf '%s\t%s\t%s\t%s\n' "$root" "$id" "$rel" "$name"
+      return 0
+    fi
   fi
-  printf '%s\t%s\n' "$digest" "$relative" >> "$tmp"
+  root="$(project_root)"
+  rel="docs/persona"
+  manifest="$root/$rel/project.md"
+  [[ -f "$manifest" ]] || return 1
+  id="$(frontmatter_value "$manifest" id 2>/dev/null || true)"
+  name="$(frontmatter_value "$manifest" name 2>/dev/null || basename "$root")"
+  [[ -n "$id" ]] || return 1
+  validate_project_id "$id"
+  printf '%s\t%s\t%s\t%s\n' "$root" "$id" "$rel" "$name"
+}
+
+register_project() {
+  local root="$1" id="$2" rel="$3" name="$4" allow_clone="${5:-0}" tmp old_root old_id old_rel old_name
+  validate_project_id "$id"
+  mkdir -p "$PROJECT_STATE_DIR"
+  if [[ -f "$PROJECT_MAP" ]]; then
+    while IFS=$'\t' read -r old_root old_id old_rel old_name; do
+      if [[ "$old_id" == "$id" && "$old_root" != "$root" && "$allow_clone" != "1" ]]; then
+        die "같은 프로젝트 ID가 다른 경로에 등록되어 있습니다. 복제본이라면 --clone을 붙여 다시 실행하세요: $old_root"
+      fi
+    done < "$PROJECT_MAP"
+  fi
+  tmp="$(mktemp "$PROJECT_STATE_DIR/.paths.XXXXXX")"
+  if [[ -f "$PROJECT_MAP" ]]; then awk -F '\t' -v wanted="$root" '$1 != wanted { print }' "$PROJECT_MAP" > "$tmp"; fi
+  printf '%s\t%s\t%s\t%s\n' "$root" "$id" "$rel" "$(printf '%s' "$name" | tr '\t\r\n' '   ')" >> "$tmp"
   chmod 600 "$tmp"
-  mv "$tmp" "$PENDING_FILE"
+  mv "$tmp" "$PROJECT_MAP"
 }
 
-validate_pending_memory() {
-  local repo="$1" expected_hash="$2" relative="$3" file id actual_hash expected_scope="" expected_audience=""
-  case "$relative" in
-    memory/global/shared/entries/*.md) expected_scope="global"; expected_audience="shared" ;;
-    memory/global/journals/loop/*.md) expected_scope="global"; expected_audience="loop" ;;
-    memory/global/journals/soul/*.md) expected_scope="global"; expected_audience="soul" ;;
-    memory/global/journals/core/*.md) expected_scope="global"; expected_audience="core" ;;
-    memory/projects/*/shared/*.md) expected_scope="project"; expected_audience="shared" ;;
-    memory/projects/*/journals/loop/*.md) expected_scope="project"; expected_audience="loop" ;;
-    memory/projects/*/journals/soul/*.md) expected_scope="project"; expected_audience="soul" ;;
-    memory/projects/*/journals/core/*.md) expected_scope="project"; expected_audience="core" ;;
-    memory/retractions/*.md) ;;
-    *) die "허용되지 않은 기억 경로가 동기화 대기열에 있습니다: $relative" ;;
-  esac
-  [[ "$relative" =~ ^memory/(global/(shared/entries|journals/(loop|soul|core))|projects/[A-Za-z0-9._-]+/(shared|journals/(loop|soul|core))|retractions)/[A-Za-z0-9._:-]+\.md$ ]] \
-    || die "안전하지 않은 기억 경로가 동기화 대기열에 있습니다: $relative"
-  file="$repo/$relative"
-  [[ -f "$file" && ! -L "$file" ]] || die "대기 중인 기억 파일이 없거나 심볼릭 링크입니다: $relative"
-  id="$(basename "$file" .md)"
-  grep -Fqx "id: \"$id\"" "$file" || die "기억 ID 메타데이터가 파일명과 다릅니다: $relative"
-  grep -Fqx 'approved_by: "creator"' "$file" || die "승인 메타데이터가 없는 기억입니다: $relative"
-  if [[ -n "$expected_scope" ]]; then
-    grep -Fqx "scope: \"$expected_scope\"" "$file" || die "기억 범위 메타데이터가 경로와 다릅니다: $relative"
-    grep -Fqx "audience: \"$expected_audience\"" "$file" || die "기억 대상 메타데이터가 경로와 다릅니다: $relative"
-    grep -Fqx 'status: "active"' "$file" || die "활성 상태 메타데이터가 없는 기억입니다: $relative"
+render_project_template() {
+  local source="$1" target="$2" project_id="$3" now_id="$4" created="$5" name="$6" index_id="${7:-}" index_title="${8:-}"
+  local line yaml_name
+  yaml_name="$(yaml_escape "$name")"
+  : > "$target"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line//@@PROJECT_ID@@/$project_id}"
+    line="${line//@@NOW_ID@@/$now_id}"
+    line="${line//@@CREATED_AT@@/$created}"
+    line="${line//@@PROJECT_NAME_YAML@@/$yaml_name}"
+    line="${line//@@PROJECT_NAME@@/$name}"
+    line="${line//@@INDEX_ID@@/$index_id}"
+    line="${line//@@INDEX_TITLE@@/$index_title}"
+    printf '%s\n' "$line" >> "$target"
+  done < "$source"
+}
+
+validate_project_docs() {
+  local docs="$1" ids file id link target dir status type immutable expected_seal actual_seal root_project_id document_project_id resolved_target
+  [[ -d "$docs" && ! -L "$docs" && -f "$docs/project.md" && -f "$docs/NOW.md" ]] \
+    || die "Persona 프로젝트 문서 구조가 없거나 손상되었습니다: $docs"
+  root_project_id="$(frontmatter_value "$docs/project.md" id 2>/dev/null || true)"
+  validate_project_id "$root_project_id"
+  ids="$(mktemp "${TMPDIR:-/tmp}/persona-doc-ids.XXXXXX")"
+  while IFS= read -r file; do
+    [[ ! -L "$file" ]] || { rm -f "$ids"; die "프로젝트 문서에 심볼릭 링크를 사용할 수 없습니다: $file"; }
+    id="$(frontmatter_value "$file" id 2>/dev/null || true)"
+    [[ -n "$id" ]] || { rm -f "$ids"; die "문서 ID가 없습니다: $file"; }
+    [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]] || { rm -f "$ids"; die "안전하지 않은 문서 ID입니다: $file"; }
+    if [[ "$file" != "$docs/project.md" ]]; then
+      document_project_id="$(frontmatter_value "$file" project_id 2>/dev/null || true)"
+      [[ "$document_project_id" == "$root_project_id" ]] || { rm -f "$ids"; die "문서의 프로젝트 ID가 정본과 다릅니다: $file"; }
+    fi
+    printf '%s\t%s\n' "$id" "$file" >> "$ids"
+    if contains_secret < "$file"; then rm -f "$ids"; die "프로젝트 문서에 비밀정보로 보이는 내용이 있습니다: $file"; fi
+    if contains_local_project_metadata < "$file"; then
+      rm -f "$ids"; die "프로젝트 문서에 로컬 경로나 작업 ID로 보이는 내용이 있습니다: $file"
+    fi
+    case "$file" in
+      "$docs"/meetings/*.md)
+        type="$(frontmatter_value "$file" type 2>/dev/null || true)"
+        status="$(frontmatter_value "$file" status 2>/dev/null || true)"
+        immutable="$(frontmatter_value "$file" immutable 2>/dev/null || true)"
+        expected_seal="$(frontmatter_value "$file" sealed_sha256 2>/dev/null || true)"
+        actual_seal="$(document_seal_hash "$file")"
+        [[ "$type" == "meeting" && "$status" == "approved" && "$immutable" == "true" && -n "$expected_seal" && "$expected_seal" == "$actual_seal" ]] \
+          || { rm -f "$ids"; die "승인된 회의 기록의 봉인이 없거나 내용이 변경되었습니다: $file"; }
+        ;;
+    esac
+    dir="$(dirname "$file")"
+    while IFS= read -r link; do
+      link="${link#](}"; link="${link%)}"; target="${link%%#*}"
+      [[ -n "$target" ]] || continue
+      case "$target" in
+        http://*|https://*|mailto:*) continue ;;
+        codex:*|/*) rm -f "$ids"; die "프로젝트 문서에는 로컬 앱 링크나 절대 경로를 넣을 수 없습니다: $file -> $target" ;;
+      esac
+      [[ -e "$dir/$target" ]] || { rm -f "$ids"; die "깨진 상대 링크입니다: $file -> $target"; }
+      [[ ! -L "$dir/$target" ]] || { rm -f "$ids"; die "심볼릭 링크 대상은 Persona 문서에서 참조할 수 없습니다: $file -> $target"; }
+      resolved_target="$(cd "$(dirname "$dir/$target")" && pwd -P)/$(basename "$target")"
+      path_is_within "$resolved_target" "$(cd "$docs" && pwd -P)" \
+        || { rm -f "$ids"; die "Persona 문서 폴더 밖으로 나가는 상대 링크입니다: $file -> $target"; }
+    done < <(grep -Eo '\]\([^)]*\)' "$file" 2>/dev/null || true)
+  done < <(find "$docs" -type f -name '*.md' -print | sort)
+  if [[ -n "$(cut -f1 "$ids" | sort | uniq -d)" ]]; then
+    rm -f "$ids"; die "프로젝트 문서 ID가 중복됩니다."
   fi
-  if contains_secret < "$file"; then die "비밀정보로 보이는 내용이 기억 파일에 추가되어 동기화를 중단했습니다: $relative"; fi
-  actual_hash="$(hash_file "$file")"
-  [[ "$actual_hash" == "$expected_hash" ]] || die "승인 뒤 변경된 기억은 다시 승인해야 합니다: $relative"
+  rm -f "$ids"
+  status="$(frontmatter_value "$docs/project.md" status 2>/dev/null || true)"
+  [[ "$status" == "active" || "$status" == "archived" ]] || die "project.md 상태가 올바르지 않습니다."
 }
 
-yaml_escape() {
-  printf '%s' "$1" | tr '\r\n' '  ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+write_generated_index() {
+  local target="$1" title="$2" project_id="$3" docs="$4" category="$5" created original_created id tmp listing file rel heading status
+  created="$(timestamp)"
+  original_created="$(frontmatter_value "$target" created_at 2>/dev/null || printf '%s' "$created")"
+  id="$(frontmatter_value "$target" id 2>/dev/null || printf 'index-%s' "$(new_uuid)")"
+  tmp="$(mktemp "$(dirname "$target")/.index.XXXXXX")"
+  listing="$(mktemp "$(dirname "$target")/.index-list.XXXXXX")"
+  if [[ "$category" == "archive" ]]; then
+    while IFS= read -r file; do
+      [[ "$(frontmatter_value "$file" status 2>/dev/null || true)" == "archived" ]] || continue
+      rel="${file#"$docs/"}"; heading="$(awk '/^# / {sub(/^# /, ""); print; exit}' "$file")"
+      printf -- '- [%s](../%s)\n' "${heading:-${file##*/}}" "$rel" >> "$listing"
+    done < <(find "$docs/projects" "$docs/meetings" "$docs/resources" "$docs/decisions" -type f -name '*.md' -print 2>/dev/null | sort)
+  elif [[ "$category" == "backlinks" ]]; then
+    while IFS= read -r file; do
+      rel="${file#"$docs/"}"
+      while IFS= read -r status; do
+        status="${status#](}"; status="${status%)}"
+        case "$status" in http://*|https://*|mailto:*|codex:*|/*|'') continue ;; esac
+        printf -- '- `%s` <- [%s](../%s)\n' "$status" "${file##*/}" "$rel" >> "$listing"
+      done < <(grep -Eo '\]\([^)]*\)' "$file" 2>/dev/null || true)
+    done < <(find "$docs" -type f -name '*.md' ! -path "$docs/indexes/*" -print | sort)
+  else
+    while IFS= read -r file; do
+      rel="${file#"$docs/"}"; heading="$(awk '/^# / {sub(/^# /, ""); print; exit}' "$file")"; status="$(frontmatter_value "$file" status 2>/dev/null || printf unknown)"
+      printf -- '- [%s](../%s) - `%s`\n' "${heading:-${file##*/}}" "$rel" "$status" >> "$listing"
+    done < <(find "$docs/$category" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null | sort)
+  fi
+  {
+    printf '%s\n' '---'
+    printf 'id: "%s"\n' "$id"
+    printf 'schema_version: "2"\n'
+    printf 'type: "generated-index"\nstatus: "active"\n'
+    printf 'created_at: "%s"\nupdated_at: "%s"\n' "$original_created" "$created"
+    printf 'project_id: "%s"\nvisibility: "public-safe"\ngenerated: true\n' "$project_id"
+    printf '%s\n\n' '---'
+    printf '# %s\n\n<!-- PERSONA-GENERATED:START -->\n' "$title"
+    if [[ -s "$listing" ]]; then cat "$listing"; else printf '아직 기록이 없습니다.\n'; fi
+    printf '%s\n' '<!-- PERSONA-GENERATED:END -->'
+  } > "$tmp"
+  rm -f "$listing"
+  chmod 644 "$tmp"
+  mv "$tmp" "$target"
+}
+
+generate_project_indexes() {
+  local docs="$1" project_id="$2"
+  mkdir -p "$docs/indexes"
+  write_generated_index "$docs/indexes/projects.md" "작업 주기" "$project_id" "$docs" projects
+  write_generated_index "$docs/indexes/meetings.md" "회의" "$project_id" "$docs" meetings
+  write_generated_index "$docs/indexes/resources.md" "리소스" "$project_id" "$docs" resources
+  write_generated_index "$docs/indexes/decisions.md" "결정" "$project_id" "$docs" decisions
+  write_generated_index "$docs/indexes/archive.md" "Archive" "$project_id" "$docs" archive
+  write_generated_index "$docs/indexes/backlinks.md" "역링크" "$project_id" "$docs" backlinks
+}
+
+command_project_init() {
+  local docs_rel="docs/persona" name="" allow_clone=0 root target stage repo project_id now_id created
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --docs) [[ $# -ge 2 ]] || die "--docs 값이 필요합니다."; docs_rel="$2"; shift 2 ;;
+      --name) [[ $# -ge 2 ]] || die "--name 값이 필요합니다."; name="$2"; shift 2 ;;
+      --clone) allow_clone=1; shift ;;
+      *) die "사용법: persona project init [--docs <relative-path>] [--name <name>] [--clone]" ;;
+    esac
+  done
+  validate_docs_relative_path "$docs_rel"
+  root="$(project_root)"; target="$root/$docs_rel"; name="${name:-$(basename "$root")}"; name="$(printf '%s' "$name" | tr '\t\r\n' '   ')"
+  [[ -n "$name" ]] || die "프로젝트 이름은 비워둘 수 없습니다."
+  [[ "$name" != *'@@'* ]] || die "프로젝트 이름에는 템플릿 표시인 @@를 사용할 수 없습니다."
+  [[ "$root" != *$'\t'* && "$name" != *$'\t'* ]] || die "프로젝트 경로나 이름에 탭을 사용할 수 없습니다."
+  if [[ -e "$target" ]]; then
+    [[ -d "$target" && ! -L "$target" && -f "$target/project.md" ]] || die "선택한 문서 경로에 Persona가 관리하지 않는 자료가 있습니다: $target"
+    project_id="$(frontmatter_value "$target/project.md" id 2>/dev/null || true)"
+    [[ -n "$project_id" ]] || die "기존 project.md에 프로젝트 ID가 없습니다."
+    validate_project_docs "$target"
+    register_project "$root" "$project_id" "$docs_rel" "$name" "$allow_clone"
+    info "기존 Persona 프로젝트 문서를 연결했습니다: $project_id"
+    return 0
+  fi
+  repo="$(resolve_repo_root)"; project_id="project-$(new_uuid)"; now_id="now-$(new_uuid)"; created="$(timestamp)"
+  stage="$(mktemp -d "$root/.persona-docs-init.XXXXXX")"
+  mkdir -p "$stage/projects" "$stage/meetings" "$stage/resources" "$stage/decisions" "$stage/indexes"
+  render_project_template "$repo/templates/project-docs/project.md.in" "$stage/project.md" "$project_id" "$now_id" "$created" "$name"
+  render_project_template "$repo/templates/project-docs/NOW.md.in" "$stage/NOW.md" "$project_id" "$now_id" "$created" "$name"
+  generate_project_indexes "$stage" "$project_id"
+  validate_project_docs "$stage"
+  mkdir -p "$(dirname "$target")"
+  mv "$stage" "$target"
+  register_project "$root" "$project_id" "$docs_rel" "$name" "$allow_clone"
+  info "Persona 프로젝트 문서를 만들었습니다: $target"
+  info "project id: $project_id"
+}
+
+command_project() {
+  local action="${1:-}" line root id rel name docs
+  case "$action" in
+    init) command_project_init "$@" ;;
+    status)
+      [[ $# -eq 1 ]] || die "사용법: persona project status"
+      line="$(current_project_docs 2>/dev/null || true)"; [[ -n "$line" ]] || die "현재 프로젝트에 Persona 문서가 없습니다."
+      IFS=$'\t' read -r root id rel name <<< "$line"
+      printf 'project: %s\nname: %s\nroot: %s\ndocs: %s/%s\n' "$id" "$name" "$root" "$root" "$rel"
+      ;;
+    validate)
+      [[ $# -eq 1 ]] || die "사용법: persona project validate"
+      line="$(current_project_docs 2>/dev/null || true)"; [[ -n "$line" ]] || die "현재 프로젝트에 Persona 문서가 없습니다."
+      IFS=$'\t' read -r root id rel name <<< "$line"; validate_project_docs "$root/$rel"; info "프로젝트 문서 검증을 통과했습니다."
+      ;;
+    index)
+      [[ $# -eq 2 && "$2" == "--approved" ]] || die "사용법: persona project index --approved"
+      line="$(current_project_docs 2>/dev/null || true)"; [[ -n "$line" ]] || die "현재 프로젝트에 Persona 문서가 없습니다."
+      IFS=$'\t' read -r root id rel name <<< "$line"; docs="$root/$rel"; validate_project_docs "$docs"; generate_project_indexes "$docs" "$id"; validate_project_docs "$docs"; info "프로젝트 색인을 갱신했습니다."
+      ;;
+    use) die "persona project use는 v2에서 제거되었습니다. persona project init --name <name>을 사용하세요." ;;
+    *) die "사용법: persona project init|status|validate|index" ;;
+  esac
+}
+
+memory_is_retracted() { [[ -f "$RETRACTION_DIR/$1.md" ]]; }
+memory_summary() { frontmatter_value "$1" summary 2>/dev/null || true; }
+memory_id() { basename "$1" .md; }
+
+collect_memory_files() {
+  local persona="$1" dir
+  for dir in "$SHARED_MEMORY_DIR" "$CAPSULE_DIR" "$JOURNAL_DIR/$persona"; do
+    [[ -d "$dir" ]] && find "$dir" -maxdepth 1 -type f -name '*.md' -print
+  done
+}
+
+rebuild_private_indexes() {
+  local persona file id relative summary unsorted tmp
+  mkdir -p "$PRIVATE_INDEX_DIR"
+  for persona in loop soul core; do
+    unsorted="$(mktemp "$PRIVATE_INDEX_DIR/.${persona}-index-unsorted.XXXXXX")"
+    tmp="$(mktemp "$PRIVATE_INDEX_DIR/.${persona}-index.XXXXXX")"
+    while IFS= read -r file; do
+      [[ -f "$file" && ! -L "$file" ]] || continue
+      id="$(memory_id "$file")"; memory_is_retracted "$id" && continue
+      relative="${file#"$PRIVATE_DIR/"}"; summary="$(memory_summary "$file" | tr '\t\r\n' '   ')"
+      printf '%s\t%s\t%s\n' "$id" "$relative" "${summary:-로컬 기억}" >> "$unsorted"
+    done < <(collect_memory_files "$persona")
+    LC_ALL=C sort "$unsorted" > "$tmp"
+    rm -f "$unsorted"; chmod 600 "$tmp"; mv "$tmp" "$PRIVATE_INDEX_DIR/$persona.tsv"
+  done
+}
+
+command_context() {
+  local persona="${1:-}" repo index file id relative summary line root project_id rel name count=0 recent
+  [[ $# -eq 1 ]] || die "사용법: persona context loop|soul|core"
+  validate_persona "$persona"; repo="$(resolve_repo_root)"
+  printf '# Persona canonical context\n\n'; cat "$repo/canon/team.md"; printf '\n'; cat "$repo/canon/$persona.md"
+  if [[ -f "$PRIVATE_DIR/shared/profile.md" && ! -L "$PRIVATE_DIR/shared/profile.md" ]]; then printf '\n'; cat "$PRIVATE_DIR/shared/profile.md"; fi
+  index="$PRIVATE_INDEX_DIR/$persona.tsv"; [[ -f "$index" && ! -L "$index" ]] || rebuild_private_indexes
+  if [[ -s "$index" ]]; then
+    printf '\n## Active local persona memory\n\n'
+    while IFS=$'\t' read -r id relative summary; do printf -- '- `%s`: %s\n' "$id" "$summary"; count=$((count+1)); done < "$index"
+    printf '\n## Relevant recent details\n'
+    recent="$(mktemp "${TMPDIR:-/tmp}/persona-memory-recent.XXXXXX")"; tail -n 8 "$index" > "$recent"
+    while IFS=$'\t' read -r id relative summary; do file="$PRIVATE_DIR/$relative"; [[ -f "$file" && ! -L "$file" ]] || continue; printf '\n'; cat "$file"; done < "$recent"
+    rm -f "$recent"
+  fi
+  line="$(current_project_docs 2>/dev/null || true)"
+  if [[ -n "$line" ]]; then
+    IFS=$'\t' read -r root project_id rel name <<< "$line"
+    printf '\n## Current project\n\n- id: `%s`\n- docs: `%s`\n' "$project_id" "$rel"
+    if [[ -f "$root/$rel/NOW.md" ]]; then printf '\n'; cat "$root/$rel/NOW.md"; fi
+  fi
 }
 
 command_memory_add() {
-  local scope="" audience="" summary="" body="" kind="note" approved=0 project_id=""
-  local repo base id created file tmp safe_summary
+  local scope="" audience="" summary="" body="" kind="note" approval="" base id created file tmp safe_summary count
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scope) [[ $# -ge 2 ]] || die "--scope 값이 필요합니다."; scope="$2"; shift 2 ;;
@@ -770,172 +1202,386 @@ command_memory_add() {
       --summary) [[ $# -ge 2 ]] || die "--summary 값이 필요합니다."; summary="$2"; shift 2 ;;
       --text) [[ $# -ge 2 ]] || die "--text 값이 필요합니다."; body="$2"; shift 2 ;;
       --kind) [[ $# -ge 2 ]] || die "--kind 값이 필요합니다."; kind="$2"; shift 2 ;;
-      --approved) approved=1; shift ;;
+      --approved) approval="creator"; shift ;;
+      --standing-consent) approval="standing-consent"; shift ;;
       *) die "알 수 없는 memory add 옵션입니다: $1" ;;
     esac
   done
-  [[ "$approved" == "1" ]] || die "창작자님의 명시적 승인 뒤 --approved를 지정해야 합니다."
-  case "$scope" in global|project) ;; *) die "--scope는 global 또는 project여야 합니다." ;; esac
+  [[ "$scope" != "project" ]] || die "프로젝트 기억은 v2에서 docs/persona/에 기록합니다. persona project init을 사용하세요."
+  [[ "$scope" == "global" ]] || die "--scope는 global만 지원합니다."
   case "$audience" in shared|loop|soul|core) ;; *) die "--audience는 shared, loop, soul, core 중 하나여야 합니다." ;; esac
-  case "$kind" in note|fact|decision|preference|journal|reflection) ;; *) die "지원하지 않는 기억 종류입니다." ;; esac
+  case "$kind" in note|fact|decision|preference|journal|reflection|capsule) ;; *) die "지원하지 않는 기억 종류입니다." ;; esac
   [[ -n "$summary" && -n "$body" ]] || die "--summary와 --text는 비워둘 수 없습니다."
-  if printf '%s\n%s\n' "$summary" "$body" | contains_secret; then
-    die "비밀정보로 보이는 내용은 공식 기억에 저장할 수 없습니다."
+  if [[ "$approval" == "standing-consent" ]]; then
+    [[ "$audience" != "shared" && ( "$kind" == "journal" || "$kind" == "reflection" ) ]] \
+      || die "상시 동의는 페르소나별 journal 또는 reflection에만 사용할 수 있습니다."
+  elif [[ "$approval" != "creator" ]]; then
+    die "창작자님의 명시적 승인 뒤 --approved를 지정해야 합니다."
   fi
-  repo="$(resolve_repo_root)"
-  if [[ "$scope" == "project" ]]; then
-    project_id="$(auto_project_id 2>/dev/null || true)"
-    [[ -n "$project_id" ]] || die "프로젝트를 식별할 수 없습니다. 먼저 persona project use <slug>를 실행하세요."
-    if [[ "$audience" == "shared" ]]; then base="$repo/memory/projects/$project_id/shared"; else base="$repo/memory/projects/$project_id/journals/$audience"; fi
-  else
-    if [[ "$audience" == "shared" ]]; then base="$repo/memory/global/shared/entries"; else base="$repo/memory/global/journals/$audience"; fi
-  fi
-  mkdir -p "$base"
-  created="$(timestamp)"
-  if command -v uuidgen >/dev/null 2>&1; then
-    id="${created}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
-  else
-    id="${created}-$$-$(printf '%s' "$summary$created$$" | hash_text)"
-  fi
-  file="$base/$id.md"
-  tmp="$(mktemp "$base/.memory.XXXXXX")"
-  safe_summary="$(yaml_escape "$summary")"
+  if printf '%s\n%s\n' "$summary" "$body" | contains_secret; then die "비밀정보로 보이는 내용은 로컬 기억에도 저장할 수 없습니다."; fi
+  if printf '%s\n%s\n' "$summary" "$body" | contains_sensitive_inference; then die "민감한 성향이나 상태에 대한 추론은 Persona 기억에 저장할 수 없습니다."; fi
+  case "$kind:$audience" in capsule:shared) base="$CAPSULE_DIR" ;; *:shared) base="$SHARED_MEMORY_DIR" ;; *) base="$JOURNAL_DIR/$audience" ;; esac
+  mkdir -p "$base"; created="$(timestamp)"; id="${created}-$(new_uuid)"; file="$base/$id.md"; tmp="$(mktemp "$base/.memory.XXXXXX")"; safe_summary="$(yaml_escape "$summary")"
   {
-    printf '%s\n' '---'
-    printf 'id: "%s"\n' "$id"
-    printf 'created_at: "%s"\n' "$created"
-    printf 'scope: "%s"\n' "$scope"
-    if [[ -n "$project_id" ]]; then printf 'project: "%s"\n' "$project_id"; fi
-    printf 'audience: "%s"\n' "$audience"
-    printf 'kind: "%s"\n' "$kind"
-    printf 'summary: "%s"\n' "$safe_summary"
-    printf 'approved_by: "creator"\n'
-    printf 'status: "active"\n'
-    printf '%s\n\n' '---'
-    printf '%s\n' "$body"
+    printf '%s\n' '---'; printf 'id: "%s"\ncreated_at: "%s"\nscope: "global-local"\naudience: "%s"\nkind: "%s"\nsummary: "%s"\napproved_by: "%s"\nevidence: "%s"\nstatus: "active"\n' "$id" "$created" "$audience" "$kind" "$safe_summary" "$approval" "$approval"; printf '%s\n\n' '---'; printf '%s\n' "$body"
   } > "$tmp"
-  mv "$tmp" "$file"
-  pending_add "$repo" "$file"
-  info "기억을 기록했습니다: $id"
+  chmod 600 "$tmp"; mv "$tmp" "$file"
+  if [[ "$audience" != "shared" ]]; then
+    count="$(find "$JOURNAL_DIR/$audience" -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')"
+    if (( count > 30 )); then warn "$audience 활성 관계 일지가 30개를 넘었습니다. 다음 자연스러운 확인 지점에 통합이 필요합니다."; fi
+  fi
+  rebuild_private_indexes
+  info "이 Mac의 로컬 기억에 기록했습니다: $id"
+}
+
+find_memory_file() {
+  local id="$1" dir file
+  for dir in "$SHARED_MEMORY_DIR" "$CAPSULE_DIR" "$JOURNAL_DIR/loop" "$JOURNAL_DIR/soul" "$JOURNAL_DIR/core"; do
+    file="$dir/$id.md"; if [[ -f "$file" && ! -L "$file" ]]; then printf '%s\n' "$file"; return 0; fi
+  done
+  return 1
 }
 
 command_memory_retract() {
-  local id="${1:-}" approved="${2:-}" repo original tombstone tmp
+  local id="${1:-}" approved="${2:-}" original tombstone tmp
   [[ $# -eq 2 && "$approved" == "--approved" ]] || die "사용법: persona memory retract <id> --approved"
   [[ "$id" =~ ^[A-Za-z0-9._:-]+$ ]] || die "잘못된 기억 ID입니다."
-  repo="$(resolve_repo_root)"
-  original="$(find "$repo/memory" -type f -name "$id.md" ! -path '*/retractions/*' -print -quit)"
-  [[ -n "$original" ]] || die "기억 ID를 찾을 수 없습니다: $id"
-  tombstone="$repo/memory/retractions/$id.md"
-  [[ ! -e "$tombstone" ]] || die "이미 철회된 기억입니다: $id"
-  mkdir -p "$(dirname "$tombstone")"
-  tmp="$(mktemp "$repo/memory/retractions/.retract.XXXXXX")"
-  {
-    printf '%s\n' '---'
-    printf 'id: "%s"\n' "$id"
-    printf 'retracted_at: "%s"\n' "$(timestamp)"
-    printf 'approved_by: "creator"\n'
-    printf '%s\n\n' '---'
-    printf 'This memory is excluded from active persona context.\n'
-  } > "$tmp"
-  mv "$tmp" "$tombstone"
-  pending_add "$repo" "$tombstone"
-  info "기억을 활성 문맥에서 철회했습니다: $id"
+  original="$(find_memory_file "$id" 2>/dev/null || true)"; [[ -n "$original" ]] || die "로컬 기억 ID를 찾을 수 없습니다: $id"
+  tombstone="$RETRACTION_DIR/$id.md"; [[ ! -e "$tombstone" ]] || die "이미 철회된 기억입니다: $id"; tmp="$(mktemp "$RETRACTION_DIR/.retract.XXXXXX")"
+  { printf '%s\n' '---'; printf 'id: "%s"\nretracted_at: "%s"\napproved_by: "creator"\n' "$id" "$(timestamp)"; printf '%s\n\n' '---'; printf 'This local memory is excluded from active persona context.\n'; } > "$tmp"
+  chmod 600 "$tmp"; mv "$tmp" "$tombstone"; rebuild_private_indexes; info "로컬 기억을 활성 문맥에서 철회했습니다: $id"
+}
+
+command_memory_status() {
+  local profile shared journals capsules retracted
+  if [[ -f "$PRIVATE_DIR/shared/profile.md" ]]; then profile="present"; else profile="absent"; fi
+  shared="$(find "$SHARED_MEMORY_DIR" -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')"
+  journals="$(find "$JOURNAL_DIR" -type f -name '*.md' | wc -l | tr -d ' ')"
+  capsules="$(find "$CAPSULE_DIR" -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')"
+  retracted="$(find "$RETRACTION_DIR" -maxdepth 1 -type f -name '*.md' | wc -l | tr -d ' ')"
+  printf 'storage: %s\nprofile: %s\nshared: %s\njournals: %s\ncapsules: %s\nretracted: %s\nsync: disabled (local Mac only)\n' "$PRIVATE_DIR" "$profile" "$shared" "$journals" "$capsules" "$retracted"
 }
 
 command_memory() {
-  local action="${1:-}"
-  shift || true
+  local action="${1:-}"; shift || true
+  case "$action" in add) command_memory_add "$@" ;; retract) command_memory_retract "$@" ;; status) [[ $# -eq 0 ]] || die "사용법: persona memory status"; command_memory_status ;; *) die "사용법: persona memory add|retract|status" ;; esac
+}
+
+current_project_fields() {
+  local line
+  line="$(current_project_docs 2>/dev/null || true)"
+  [[ -n "$line" ]] || die "현재 프로젝트에 Persona 문서가 없습니다. 먼저 persona project init을 실행하세요."
+  printf '%s\n' "$line"
+}
+
+team_binding_file() {
+  local project_id="$1"
+  printf '%s/%s.tsv\n' "$TASK_BINDING_DIR" "$project_id"
+}
+
+team_cursor_file() {
+  local project_id="$1" persona="$2"
+  printf '%s/%s/%s.cursor\n' "$CURSOR_DIR" "$project_id" "$persona"
+}
+
+command_team() {
+  local action="${1:-}" line root project_id rel name persona thread_id host_id file tmp cursor_file value
   case "$action" in
-    add) command_memory_add "$@" ;;
-    retract) command_memory_retract "$@" ;;
-    *) die "사용법: persona memory add ... | persona memory retract ..." ;;
+    bind)
+      [[ $# -ge 3 && $# -le 4 ]] || die "사용법: persona team bind loop|soul|core <thread-id> [host-id]"
+      persona="$2"; thread_id="$3"; host_id="${4:--}"; validate_persona "$persona"
+      [[ "$thread_id" =~ ^[A-Za-z0-9._:-]+$ && "$host_id" =~ ^[A-Za-z0-9._:-]+$ ]] || die "작업 또는 호스트 ID 형식이 안전하지 않습니다."
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; file="$(team_binding_file "$project_id")"; mkdir -p "$TASK_BINDING_DIR"; tmp="$(mktemp "$TASK_BINDING_DIR/.binding.XXXXXX")"
+      if [[ -f "$file" ]]; then awk -F '\t' -v wanted="$persona" '$1 != wanted { print }' "$file" > "$tmp"; fi
+      printf '%s\t%s\t%s\n' "$persona" "$thread_id" "$host_id" >> "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$file"; info "$name 프로젝트의 $persona 작업을 정확한 ID로 연결했습니다."
+      ;;
+    status)
+      [[ $# -eq 1 ]] || die "사용법: persona team status"
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; file="$(team_binding_file "$project_id")"
+      printf 'project: %s\nname: %s\n' "$project_id" "$name"
+      for persona in loop soul core; do
+        if [[ -f "$file" ]] && value="$(awk -F '\t' -v wanted="$persona" '$1==wanted {print $2 " / " $3; found=1; exit} END{if(!found) exit 1}' "$file" 2>/dev/null)"; then
+          printf '%s: %s\n' "$persona" "$value"
+        else printf '%s: <unbound>\n' "$persona"; fi
+        cursor_file="$(team_cursor_file "$project_id" "$persona")"; if [[ -f "$cursor_file" ]]; then printf '%s cursor: %s\n' "$persona" "$(cat "$cursor_file")"; fi
+      done
+      ;;
+    cursor)
+      [[ $# -ge 3 ]] || die "사용법: persona team cursor get|set loop|soul|core [cursor]"
+      persona="$3"; validate_persona "$persona"; line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; cursor_file="$(team_cursor_file "$project_id" "$persona")"
+      case "$2" in
+        get) [[ $# -eq 3 ]] || die "사용법: persona team cursor get <persona>"; [[ -f "$cursor_file" ]] && cat "$cursor_file" || printf '<none>\n' ;;
+        set) [[ $# -eq 4 ]] || die "사용법: persona team cursor set <persona> <cursor>"; value="$4"; [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "확인 지점 값이 안전하지 않습니다."; mkdir -p "$(dirname "$cursor_file")"; chmod 700 "$(dirname "$cursor_file")"; tmp="$(mktemp "$(dirname "$cursor_file")/.cursor.XXXXXX")"; printf '%s\n' "$value" > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$cursor_file" ;;
+        *) die "사용법: persona team cursor get|set ..." ;;
+      esac
+      ;;
+    clear)
+      [[ $# -eq 2 && "$2" == "--approved" ]] || die "사용법: persona team clear --approved"
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; file="$(team_binding_file "$project_id")"
+      rm -f -- "$file"; [[ ! -e "$CURSOR_DIR/$project_id" || -L "$CURSOR_DIR/$project_id" ]] || rm -rf -- "$CURSOR_DIR/$project_id"
+      info "$name 프로젝트의 로컬 작업 연결과 확인 지점을 제거했습니다. 프로젝트 문서는 보존했습니다."
+      ;;
+    *) die "사용법: persona team bind|status|cursor|clear" ;;
   esac
 }
 
-deploy_from_repo() {
-  local repo
-  repo="$(resolve_repo_root)"
-  check_install_conflicts
-  install_agents_block "$repo"
-  install_skill "$repo"
-  install_launcher "$repo"
-  apply_models
+write_pending_record() {
+  local base="$1" prefix="$2" project_id="$3" persona="$4" source_id="$5" summary="$6" body="$7" id created file tmp
+  mkdir -p "$base/$project_id"; chmod 700 "$base/$project_id"; created="$(timestamp)"; id="$prefix-$created-$(new_uuid)"; file="$base/$project_id/$id.md"; tmp="$(mktemp "$base/$project_id/.pending.XXXXXX")"
+  {
+    printf '%s\n' '---'; printf 'id: "%s"\ncreated_at: "%s"\nproject_id: "%s"\npersona: "%s"\nsource_id: "%s"\nsummary: "%s"\nstatus: "pending"\n' "$id" "$created" "$project_id" "$persona" "$(yaml_escape "$source_id")" "$(yaml_escape "$summary")"; printf '%s\n\n' '---'; printf '%s\n' "$body"
+  } > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$file"; printf '%s\n' "$id"
+}
+
+write_approved_meeting() {
+  local target="$1" meeting_id="$2" project_id="$3" title="$4" body="$5" approved_at="$6" decision_id="$7"
+  local tmp sealed seal
+  tmp="$(mktemp "$(dirname "$target")/.meeting.XXXXXX")"
+  {
+    printf '%s\n' '---'
+    printf 'id: "%s"\nschema_version: "2"\ntype: "meeting"\nstatus: "approved"\n' "$meeting_id"
+    printf 'created_at: "%s"\napproved_at: "%s"\nproject_id: "%s"\n' "$approved_at" "$approved_at" "$project_id"
+    printf 'visibility: "public-safe"\nimmutable: true\nsealed_sha256: ""\n'
+    printf '%s\n\n' '---'
+    printf '# %s\n\n%s\n' "$title" "$body"
+    if [[ -n "$decision_id" ]]; then
+      printf '\n## 관련 결정\n\n- [확정 결정](../decisions/%s.md)\n' "$decision_id"
+    fi
+  } > "$tmp"
+  seal="$(document_seal_hash "$tmp")"
+  sealed="$(mktemp "$(dirname "$target")/.meeting-sealed.XXXXXX")"
+  awk -v value="$seal" '/^sealed_sha256:[[:space:]]*/ { print "sealed_sha256: \"" value "\""; next } { print }' "$tmp" > "$sealed"
+  rm -f "$tmp"; chmod 644 "$sealed"; mv "$sealed" "$target"
+}
+
+write_approved_decision() {
+  local target="$1" decision_id="$2" project_id="$3" meeting_id="$4" title="$5" body="$6" created="$7" tmp
+  tmp="$(mktemp "$(dirname "$target")/.decision.XXXXXX")"
+  {
+    printf '%s\n' '---'
+    printf 'id: "%s"\nschema_version: "2"\ntype: "decision"\nstatus: "active"\n' "$decision_id"
+    printf 'created_at: "%s"\nupdated_at: "%s"\nproject_id: "%s"\nvisibility: "public-safe"\n' "$created" "$created" "$project_id"
+    printf '%s\n\n' '---'
+    printf '# %s\n\n%s\n\n## 근거 회의\n\n- [승인된 회의](../meetings/%s.md)\n' "$title" "$body" "$meeting_id"
+  } > "$tmp"
+  chmod 644 "$tmp"; mv "$tmp" "$target"
+}
+
+command_handoff() {
+  local action="${1:-}" persona="" source_id="" summary="" body="" cursor="" line root project_id rel name id file count
+  case "$action" in
+    add)
+      shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --persona) persona="$2"; shift 2 ;; --source) source_id="$2"; shift 2 ;; --summary) summary="$2"; shift 2 ;; --text) body="$2"; shift 2 ;; --cursor) cursor="$2"; shift 2 ;; *) die "알 수 없는 handoff add 옵션입니다: $1" ;;
+        esac
+      done
+      validate_persona "$persona"; [[ "$persona" != "loop" ]] || die "인계 후보의 출처는 soul 또는 core여야 합니다."; [[ -n "$source_id" && -n "$summary" && -n "$body" ]] || die "handoff add에는 persona, source, summary, text가 필요합니다."
+      if printf '%s\n%s\n' "$summary" "$body" | contains_secret; then die "인계 후보에 비밀정보를 저장할 수 없습니다."; fi
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; id="$(write_pending_record "$HANDOFF_DIR" handoff "$project_id" "$persona" "$source_id" "$summary" "$body")"
+      if [[ -n "$cursor" ]]; then command_team cursor set "$persona" "$cursor"; fi
+      info "로컬 인계 후보를 보관했습니다: $id"
+      ;;
+    list)
+      [[ $# -eq 1 ]] || die "사용법: persona handoff list"
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; count=0
+      while IFS= read -r file; do printf -- '- `%s`: %s (%s)\n' "$(basename "$file" .md)" "$(frontmatter_value "$file" summary 2>/dev/null || printf 후보)" "$(frontmatter_value "$file" persona 2>/dev/null || printf unknown)"; count=$((count+1)); done < <(find "$HANDOFF_DIR/$project_id" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null | sort)
+      printf 'count: %s\n' "$count"
+      ;;
+    clear)
+      [[ $# -eq 3 && "$3" == "--approved" ]] || die "사용법: persona handoff clear <id> --approved"; id="$2"; [[ "$id" =~ ^handoff-[A-Za-z0-9._:-]+$ ]] || die "안전하지 않은 인계 후보 ID입니다."
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; file="$HANDOFF_DIR/$project_id/$id.md"; [[ -f "$file" && ! -L "$file" ]] || die "인계 후보를 찾을 수 없습니다: $id"; rm -f -- "$file"; info "인계 후보를 처리 완료로 제거했습니다: $id"
+      ;;
+    *) die "사용법: persona handoff add|list|clear" ;;
+  esac
+}
+
+command_meeting() {
+  local action="${1:-}" summary="" body="" title="" decision_title="" decision_body="" approved=0
+  local line root project_id rel name id file count docs draft stage backup lock tree_before tree_after created decision_id=""
+  case "$action" in
+    draft)
+      shift
+      while [[ $# -gt 0 ]]; do case "$1" in --summary) summary="$2"; shift 2 ;; --text) body="$2"; shift 2 ;; *) die "알 수 없는 meeting draft 옵션입니다: $1" ;; esac; done
+      [[ -n "$summary" && -n "$body" ]] || die "meeting draft에는 summary와 text가 필요합니다."; if printf '%s\n%s\n' "$summary" "$body" | contains_secret; then die "회의 초안에 비밀정보를 저장할 수 없습니다."; fi
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; id="$(write_pending_record "$MEETING_DRAFT_DIR" meeting "$project_id" loop conversation "$summary" "$body")"; info "로컬 회의 패킷을 만들었습니다: $id"
+      ;;
+    list)
+      [[ $# -eq 1 ]] || die "사용법: persona meeting list"; line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; count=0
+      while IFS= read -r file; do printf -- '- `%s`: %s\n' "$(basename "$file" .md)" "$(frontmatter_value "$file" summary 2>/dev/null || printf 초안)"; count=$((count+1)); done < <(find "$MEETING_DRAFT_DIR/$project_id" -maxdepth 1 -type f -name '*.md' -print 2>/dev/null | sort); printf 'count: %s\n' "$count"
+      ;;
+    publish)
+      [[ $# -ge 2 ]] || die "사용법: persona meeting publish <id> --title <title> --text <text> [--decision-title <title> --decision-text <text>] --approved"
+      id="$2"; shift 2
+      [[ "$id" =~ ^meeting-[A-Za-z0-9._:-]+$ ]] || die "안전하지 않은 회의 초안 ID입니다."
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --title) [[ $# -ge 2 ]] || die "--title 값이 필요합니다."; title="$2"; shift 2 ;;
+          --text) [[ $# -ge 2 ]] || die "--text 값이 필요합니다."; body="$2"; shift 2 ;;
+          --decision-title) [[ $# -ge 2 ]] || die "--decision-title 값이 필요합니다."; decision_title="$2"; shift 2 ;;
+          --decision-text) [[ $# -ge 2 ]] || die "--decision-text 값이 필요합니다."; decision_body="$2"; shift 2 ;;
+          --approved) approved=1; shift ;;
+          *) die "알 수 없는 meeting publish 옵션입니다: $1" ;;
+        esac
+      done
+      title="$(printf '%s' "$title" | tr '\t\r\n' '   ')"; decision_title="$(printf '%s' "$decision_title" | tr '\t\r\n' '   ')"
+      [[ "$approved" == "1" && -n "$title" && -n "$body" ]] || die "창작자님 승인과 title, text가 모두 필요합니다."
+      if [[ -n "$decision_title" || -n "$decision_body" ]]; then [[ -n "$decision_title" && -n "$decision_body" ]] || die "결정 제목과 내용은 함께 지정해야 합니다."; fi
+      if printf '%s\n%s\n%s\n%s\n' "$title" "$body" "$decision_title" "$decision_body" | contains_secret; then die "승인 묶음에 비밀정보를 저장할 수 없습니다."; fi
+      if printf '%s\n%s\n%s\n%s\n' "$title" "$body" "$decision_title" "$decision_body" | contains_local_project_metadata; then die "승인 묶음에 로컬 경로나 Codex 작업 ID를 저장할 수 없습니다."; fi
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; docs="$root/$rel"; draft="$MEETING_DRAFT_DIR/$project_id/$id.md"
+      [[ -f "$draft" && ! -L "$draft" ]] || die "로컬 회의 초안을 찾을 수 없습니다: $id"
+      [[ ! -e "$docs/meetings/$id.md" ]] || die "같은 회의가 이미 프로젝트 문서에 있습니다: $id"
+      validate_project_docs "$docs"; tree_before="$(directory_tree_hash "$docs")"; created="$(timestamp)"
+      if [[ -n "$decision_title" ]]; then decision_id="decision-$created-$(new_uuid)"; fi
+      stage="$(mktemp -d "$root/.persona-meeting-apply.XXXXXX")"; backup="$root/.persona-meeting-backup.$(new_uuid)"
+      cp -Rp "$docs/." "$stage/"
+      write_approved_meeting "$stage/meetings/$id.md" "$id" "$project_id" "$title" "$body" "$created" "$decision_id"
+      if [[ -n "$decision_id" ]]; then write_approved_decision "$stage/decisions/$decision_id.md" "$decision_id" "$project_id" "$id" "$decision_title" "$decision_body" "$created"; fi
+      generate_project_indexes "$stage" "$project_id"; validate_project_docs "$stage"
+      tree_after="$(directory_tree_hash "$docs")"; [[ "$tree_before" == "$tree_after" ]] || { rm -rf -- "$stage"; die "준비 중 프로젝트 문서가 바뀌어 승인 묶음을 적용하지 않았습니다."; }
+      lock="$WRITER_LOCK_DIR/$project_id.lock"; if ! mkdir "$lock" 2>/dev/null; then rm -rf -- "$stage"; die "다른 쓰기 작업이 진행 중이라 회의 묶음을 적용하지 않았습니다."; fi; chmod 700 "$lock"
+      { printf 'owner=loop\nscope=approved-meeting\ntask_id=persona-cli\ncreated_at=%s\n' "$created"; } > "$lock/info"; chmod 600 "$lock/info"
+      if ! mv "$docs" "$backup"; then rm -f "$lock/info"; rmdir "$lock"; rm -rf -- "$stage"; die "기존 프로젝트 문서를 안전하게 보관하지 못했습니다."; fi
+      if ! mv "$stage" "$docs"; then mv "$backup" "$docs" 2>/dev/null || true; rm -f "$lock/info"; rmdir "$lock" 2>/dev/null || true; die "승인 묶음 적용에 실패해 기존 프로젝트 문서를 복구했습니다."; fi
+      rm -rf -- "$backup"; rm -f "$lock/info"; rmdir "$lock"; rm -f -- "$draft"
+      info "승인된 회의를 프로젝트 문서에 원자적으로 반영했습니다: $rel/meetings/$id.md"
+      if [[ -n "$decision_id" ]]; then info "장기 결정을 함께 기록했습니다: $rel/decisions/$decision_id.md"; fi
+      ;;
+    clear)
+      [[ $# -eq 3 && "$3" == "--approved" ]] || die "사용법: persona meeting clear <id> --approved"; id="$2"; [[ "$id" =~ ^meeting-[A-Za-z0-9._:-]+$ ]] || die "안전하지 않은 회의 초안 ID입니다."; line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; file="$MEETING_DRAFT_DIR/$project_id/$id.md"; [[ -f "$file" && ! -L "$file" ]] || die "회의 초안을 찾을 수 없습니다: $id"; rm -f -- "$file"; info "회의 초안을 제거했습니다: $id"
+      ;;
+    *) die "사용법: persona meeting draft|list|publish|clear" ;;
+  esac
+}
+
+writer_lock_is_stale() {
+  local lock="$1" minutes="${PERSONA_LOCK_STALE_MINUTES:-720}"
+  [[ "$minutes" =~ ^[0-9]+$ ]] || die "잠금 만료 시간은 분 단위 숫자여야 합니다."
+  [[ -d "$lock" && ! -L "$lock" ]] || return 1
+  [[ -n "$(find "$lock" -prune -mmin "+$minutes" -print 2>/dev/null)" ]]
+}
+
+command_writer() {
+  local action="${1:-}" persona scope="" task_id="-" force=0 approved=0 line root project_id rel name lock tmp owner
+  case "$action" in
+    acquire)
+      [[ $# -ge 3 && $# -le 4 ]] || die "사용법: persona writer acquire <persona> <scope> [task-id]"; persona="$2"; scope="$3"; task_id="${4:--}"; validate_persona "$persona"; [[ -n "$scope" && "$scope" != *$'\n'* && "$scope" != *$'\t'* ]] || die "쓰기 범위가 안전하지 않습니다."; [[ "$task_id" =~ ^[A-Za-z0-9._:-]+$ ]] || die "작업 ID 형식이 안전하지 않습니다."
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; lock="$WRITER_LOCK_DIR/$project_id.lock"; mkdir -p "$WRITER_LOCK_DIR"
+      if ! mkdir "$lock" 2>/dev/null; then owner="$(awk -F= '$1=="owner" {print $2}' "$lock/info" 2>/dev/null || printf unknown)"; if writer_lock_is_stale "$lock"; then die "오래된 $owner 쓰기 잠금이 있습니다. 상태를 확인한 뒤 persona writer recover --approved를 사용하세요."; fi; die "이미 $owner 페르소나가 이 프로젝트의 쓰기를 맡고 있습니다."; fi; chmod 700 "$lock"
+      tmp="$lock/.info.temporary"; { printf 'owner=%s\nscope=%s\ntask_id=%s\ncreated_at=%s\n' "$persona" "$scope" "$task_id" "$(timestamp)"; } > "$tmp"; chmod 600 "$tmp"; mv "$tmp" "$lock/info"; info "$persona 쓰기 잠금을 획득했습니다: $scope"
+      ;;
+    status)
+      [[ $# -eq 1 ]] || die "사용법: persona writer status"; line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; lock="$WRITER_LOCK_DIR/$project_id.lock"; if [[ -f "$lock/info" ]]; then cat "$lock/info"; else printf 'writer: <none>\n'; fi
+      ;;
+    release)
+      [[ $# -ge 2 ]] || die "사용법: persona writer release <persona> [--force --approved]"; persona="$2"; validate_persona "$persona"; shift 2; while [[ $# -gt 0 ]]; do case "$1" in --force) force=1 ;; --approved) approved=1 ;; *) die "알 수 없는 writer release 옵션입니다: $1" ;; esac; shift; done
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; lock="$WRITER_LOCK_DIR/$project_id.lock"; [[ -d "$lock" && ! -L "$lock" && -f "$lock/info" ]] || die "활성 쓰기 잠금이 없습니다."; owner="$(awk -F= '$1=="owner" {print $2; exit}' "$lock/info")"
+      if [[ "$owner" != "$persona" ]]; then [[ "$force" == "1" && "$approved" == "1" ]] || die "잠금 소유자는 $owner 입니다. 상태 확인과 창작자님 승인 뒤 --force --approved를 사용하세요."; fi
+      rm -f -- "$lock/info"; rmdir "$lock"; info "쓰기 잠금을 해제했습니다."
+      ;;
+    recover)
+      [[ $# -eq 2 && "$2" == "--approved" ]] || die "사용법: persona writer recover --approved"
+      line="$(current_project_fields)"; IFS=$'\t' read -r root project_id rel name <<< "$line"; lock="$WRITER_LOCK_DIR/$project_id.lock"
+      [[ -d "$lock" && ! -L "$lock" && -f "$lock/info" ]] || die "복구할 쓰기 잠금이 없습니다."
+      writer_lock_is_stale "$lock" || die "잠금이 아직 만료되지 않았습니다. 소유 페르소나가 직접 release 해야 합니다."
+      rm -f -- "$lock/info"; rmdir "$lock"; info "창작자님 승인으로 오래된 쓰기 잠금을 복구했습니다."
+      ;;
+    *) die "사용법: persona writer acquire|status|release|recover" ;;
+  esac
 }
 
 command_sync() {
-  local repo branch pending_count=0 line expected_hash relative extra remote_heads
-  local pending_paths=()
+  die "persona sync는 v2에서 폐지되었습니다. 기억은 이 Mac에만 남습니다. 코드 갱신에는 persona update를 사용하세요."
+}
+
+directory_tree_hash() {
+  local root="$1" listing digest_list file relative result
+  [[ -d "$root" ]] || { printf 'absent\n'; return 0; }
+  listing="$(mktemp "${TMPDIR:-/tmp}/persona-private-files.XXXXXX")"
+  digest_list="$(mktemp "${TMPDIR:-/tmp}/persona-private-digests.XXXXXX")"
+  find "$root" -type f -print | LC_ALL=C sort > "$listing"
+  while IFS= read -r file; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    relative="${file#"$root/"}"
+    printf '%s  %s\n' "$(hash_file "$file")" "$relative" >> "$digest_list"
+  done < "$listing"
+  result="$(hash_file "$digest_list")"
+  rm -f "$listing" "$digest_list"
+  printf '%s\n' "$result"
+}
+
+protected_local_hash() {
+  local digest_list key
+  digest_list="$(mktemp "${TMPDIR:-/tmp}/persona-protected-state.XXXXXX")"
+  for directory in "$PRIVATE_DIR" "$PENDING_DIR" "$PROJECT_STATE_DIR" "$TASK_BINDING_DIR" "$CURSOR_DIR" "$WRITER_LOCK_DIR" "$MODEL_OVERRIDE_DIR"; do
+    printf '%s  %s\n' "$(directory_tree_hash "$directory")" "$directory" >> "$digest_list"
+  done
+  for key in install_id profile override_loop_model override_loop_effort override_soul_model override_soul_effort override_core_model override_core_effort; do
+    printf '%s=%s\n' "$key" "$(state_get "$key" 2>/dev/null || true)" >> "$digest_list"
+  done
+  hash_file "$digest_list"
+  rm -f "$digest_list"
+}
+
+command_update() {
+  local repo branch before_protected after_protected before_head after_head
+  require_macos
+  validate_local_layout
   repo="$(resolve_repo_root)"
-  git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "저장소가 아직 Git 저장소가 아닙니다."
+  git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "Persona 소스가 Git 저장소가 아닙니다: $repo"
+  [[ -z "$(git -C "$repo" status --porcelain)" ]] \
+    || die "Persona 소스 저장소에 커밋되지 않은 변경이 있어 업데이트를 중단했습니다."
   branch="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null)" \
-    || die "detached HEAD에서는 기억을 안전하게 동기화할 수 없습니다. 브랜치로 전환하세요."
-  if ! git -C "$repo" diff --cached --quiet --; then
-    die "기존 staged 변경이 있어 기억 동기화를 중단했습니다. 먼저 stage를 비우거나 커밋하세요."
-  fi
-  if [[ -s "$PENDING_FILE" ]]; then
-    while IFS=$'\t' read -r expected_hash relative extra; do
-      [[ -n "$expected_hash" && -n "$relative" && -z "$extra" ]] \
-        || die "이전 형식이거나 손상된 기억 대기열입니다. 해당 기억을 다시 승인해 주세요."
-      validate_pending_memory "$repo" "$expected_hash" "$relative"
-      pending_paths+=("$relative")
-      pending_count=$((pending_count + 1))
-    done < "$PENDING_FILE"
-    if (( pending_count > 0 )); then
-      for line in "${pending_paths[@]}"; do
-        if ! git -C "$repo" add -- "$line"; then
-          git -C "$repo" reset --quiet -- "${pending_paths[@]}" 2>/dev/null || true
-          die "기억 파일을 stage하지 못했습니다: $line"
-        fi
-      done
-      if ! git -C "$repo" -c user.name='Persona Memory' -c user.email='persona-memory@local' \
-        commit --only -m "memory: sync approved persona memories $(timestamp)" -- "${pending_paths[@]}"; then
-        git -C "$repo" reset --quiet -- "${pending_paths[@]}" 2>/dev/null || true
-        die "기억 커밋에 실패했습니다. 대기 중인 파일은 보존했습니다."
-      fi
-      : > "$PENDING_FILE"
-    fi
+    || die "브랜치가 아닌 상태에서는 안전하게 업데이트할 수 없습니다."
+  before_protected="$(protected_local_hash)"
+  before_head="$(git -C "$repo" rev-parse HEAD)"
+
+  if [[ "${PERSONA_UPDATE_SKIP_PULL:-0}" != "1" ]]; then
+    git -C "$repo" remote get-url origin >/dev/null 2>&1 \
+      || die "origin 원격 저장소가 없어 코드를 받을 수 없습니다."
+    git -C "$repo" pull --ff-only origin "$branch" \
+      || die "fast-forward 업데이트가 불가능합니다. 저장소 상태를 직접 확인하세요."
   fi
 
-  if [[ -n "$(git -C "$repo" status --porcelain)" ]]; then
-    die "기억 외의 커밋되지 않은 변경이 있어 pull/push를 중단했습니다. 먼저 해당 변경을 정리하세요."
+  [[ -z "$(git -C "$repo" status --porcelain)" ]] \
+    || die "코드를 받은 뒤 저장소가 깨끗하지 않아 설치 갱신을 중단했습니다."
+  if ! PERSONA_SOURCE_ROOT="$repo" PERSONA_SKIP_PENDING_CLEANUP=1 "$repo/scripts/persona.sh" __install; then
+    after_protected="$(protected_local_hash)"
+    [[ "$before_protected" == "$after_protected" ]] \
+      || die "설치 갱신 실패와 함께 보호된 로컬 데이터가 달라졌습니다. 백업을 확인하세요."
+    die "새 코드는 받았지만 설치 자료 갱신에 실패했습니다. 보호된 로컬 데이터는 보존했습니다."
   fi
-  if ! git -C "$repo" remote get-url origin >/dev/null 2>&1; then
-    deploy_from_repo
-    warn "origin 원격이 없어 로컬 커밋까지만 완료했습니다. 비공개 GitHub 저장소를 연결한 뒤 다시 sync 하세요."
-    return 0
-  fi
-  if remote_heads="$(git -C "$repo" ls-remote --heads origin "$branch")"; then
-    if [[ -n "$remote_heads" ]]; then
-      git -C "$repo" pull --rebase origin "$branch" || die "리베이스가 중단되었습니다. 충돌을 직접 확인하세요."
-    fi
-  else
-    die "원격 저장소에 연결하지 못했습니다. 로컬 커밋은 보존되어 있습니다."
-  fi
-  git -C "$repo" push -u origin "$branch" || die "push에 실패했습니다. 로컬 커밋은 보존되어 있습니다."
-  deploy_from_repo
-  info "공식 기억과 페르소나 자료를 동기화했습니다."
+  after_protected="$(protected_local_hash)"
+  [[ "$before_protected" == "$after_protected" ]] \
+    || die "업데이트가 보호된 로컬 데이터를 변경해 중단했습니다. 백업을 확인하세요."
+  after_head="$(git -C "$repo" rev-parse HEAD)"
+  info "Persona 코드와 설치 자료를 갱신했습니다: ${before_head:0:12} -> ${after_head:0:12}"
+  info "로컬 기억과 프로젝트 문서는 변경하지 않았고, 커밋하거나 push하지 않았습니다."
 }
 
 find_project_override() {
-  local root current
+  local field="${1:-model}" root current
   current="$(pwd -P)"
   root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -n "$root" && -f "$root/.codex/config.toml" ]]; then
-    toml_root_get "$root/.codex/config.toml" model 2>/dev/null || true
+    toml_root_get "$root/.codex/config.toml" "$field" 2>/dev/null || true
   elif [[ -f "$current/.codex/config.toml" ]]; then
-    toml_root_get "$current/.codex/config.toml" model 2>/dev/null || true
+    toml_root_get "$current/.codex/config.toml" "$field" 2>/dev/null || true
   fi
 }
 
 command_status() {
-  local profile project_override
+  local profile project_override project_effort line root project_id rel name
   profile="$(state_get profile 2>/dev/null || printf '%s' 'not-installed')"
   printf 'Persona Team %s\n' "$PERSONA_VERSION"
+  printf 'platform: macOS only\n'
   printf 'profile: %s\n' "$profile"
   if [[ "$profile" != "not-installed" ]]; then
     for persona in loop soul core; do
-      if [[ -n "$(state_get "override_${persona}_model" 2>/dev/null || true)" ]]; then
+      if [[ -n "$(state_get "override_${persona}_model" 2>/dev/null || true)" || -n "$(state_get "override_${persona}_effort" 2>/dev/null || true)" ]]; then
         printf '%s: %s / %s (source: local override)\n' "$persona" "$(effective_value "$persona" model)" "$(effective_value "$persona" effort)"
       else
         printf '%s: %s / %s (source: profile %s)\n' "$persona" "$(effective_value "$persona" model)" "$(effective_value "$persona" effort)" "$profile"
@@ -945,17 +1591,28 @@ command_status() {
   printf 'config loop: %s / %s\n' \
     "$(toml_root_get "$CODEX_DIR/config.toml" model 2>/dev/null || printf '%s' '<unset>')" \
     "$(toml_root_get "$CODEX_DIR/config.toml" model_reasoning_effort 2>/dev/null || printf '%s' '<unset>')"
-  project_override="$(find_project_override)"
-  if [[ -n "$project_override" ]]; then
-    printf 'project override: %s (전역 Loop 기본값보다 우선)\n' "$project_override"
+  project_override="$(find_project_override model)"; project_effort="$(find_project_override model_reasoning_effort)"
+  if [[ -n "$project_override" || -n "$project_effort" ]]; then
+    printf 'project override: %s / %s (전역 Loop 기본값보다 우선)\n' "${project_override:-<model unchanged>}" "${project_effort:-<effort unchanged>}"
   fi
   printf 'active desktop task: 작업별 UI 모델 선택이 위 값보다 우선할 수 있습니다.\n'
   printf 'repository: %s\n' "$(state_get repo_root 2>/dev/null || printf '%s' '<unset>')"
-  printf 'project memory: %s\n' "$(auto_project_id 2>/dev/null || printf '%s' '<unmapped>')"
+  printf 'local persona data: %s (Git sync: disabled)\n' "$PERSONA_ROOT"
+  line="$(current_project_docs 2>/dev/null || true)"
+  if [[ -n "$line" ]]; then
+    IFS=$'\t' read -r root project_id rel name <<< "$line"
+    printf 'current project: %s (%s)\nproject docs: %s/%s\n' "$name" "$project_id" "$root" "$rel"
+  else
+    printf 'current project: <not connected>\n'
+  fi
 }
 
 command_doctor() {
-  local failures=0 marker_count repo
+  local failures=0 marker_count repo line root project_id rel name mode file relative tracked_memory=""
+  require_macos
+  if ! validate_local_layout; then
+    failures=$((failures + 1))
+  fi
   if command -v codex >/dev/null 2>&1; then
     info "Codex: $(codex --version 2>/dev/null || printf '%s' '실행 실패')"
     if [[ "${PERSONA_SKIP_CODEX_VALIDATE:-0}" != "1" ]] && ! codex --strict-config --version >/dev/null 2>&1; then
@@ -975,6 +1632,32 @@ command_doctor() {
   done
   repo="$(state_get repo_root 2>/dev/null || true)"
   if [[ -z "$repo" || ! -d "$repo/.git" ]]; then warn "Git 저장소 상태를 확인하세요: ${repo:-<unset>}"; failures=$((failures + 1)); fi
+  if [[ -n "$repo" && -d "$repo/.git" ]]; then
+    while IFS= read -r relative; do
+      if [[ -e "$repo/$relative" || -L "$repo/$relative" ]]; then tracked_memory="$relative"; break; fi
+    done < <(git -C "$repo" ls-files 'memory/**' 2>/dev/null || true)
+    if [[ -n "$tracked_memory" ]]; then
+      warn "v2 소스 저장소가 전역 기억 파일을 추적하고 있습니다."
+      failures=$((failures + 1))
+    fi
+    if find "$repo" -type f \( -name '*.ps1' -o -name '*PowerShell*' \) -print -quit 2>/dev/null | grep -q .; then
+      warn "macOS 전용 v2 저장소에 Windows/PowerShell 구현 파일이 남아 있습니다."
+      failures=$((failures + 1))
+    fi
+  fi
+  line="$(current_project_docs 2>/dev/null || true)"
+  if [[ -n "$line" ]]; then
+    IFS=$'\t' read -r root project_id rel name <<< "$line"
+    if ! validate_project_docs "$root/$rel"; then failures=$((failures + 1)); fi
+  fi
+  while IFS= read -r file; do
+    mode="$(stat -f '%Lp' "$file" 2>/dev/null || printf unknown)"
+    if [[ "$mode" != "700" ]]; then warn "로컬 전용 디렉터리 권한이 0700이 아닙니다: $file ($mode)"; failures=$((failures + 1)); fi
+  done < <(find "$PERSONA_ROOT" -type d -print 2>/dev/null)
+  while IFS= read -r file; do
+    mode="$(stat -f '%Lp' "$file" 2>/dev/null || printf unknown)"
+    if [[ "$mode" != "600" ]]; then warn "로컬 전용 파일 권한이 0600이 아닙니다: $file ($mode)"; failures=$((failures + 1)); fi
+  done < <(find "$PERSONA_ROOT" -type f -print 2>/dev/null)
   if (( failures > 0 )); then
     die "진단에서 ${failures}개 문제를 찾았습니다."
   fi
@@ -994,16 +1677,51 @@ remove_block_from_file() {
 }
 
 command_uninstall() {
-  local current_model current_effort last_model last_effort original_model original_effort restore_model restore_effort shell_rc bin
-  mkdir -p "$BACKUP_DIR"
-  if [[ -f "$CODEX_DIR/AGENTS.md" ]]; then cp -p "$CODEX_DIR/AGENTS.md" "$BACKUP_DIR/AGENTS.md.uninstall.$(timestamp).$$.bak"; fi
-  remove_block_from_file "$CODEX_DIR/AGENTS.md" "$AGENTS_START" "$AGENTS_END"
-  for file in "$CODEX_DIR/agents/soul.toml" "$CODEX_DIR/agents/core.toml"; do
-    if [[ -f "$file" ]] && grep -Fq "$MANAGED_AGENT_MARKER" "$file"; then rm -f "$file"; fi
-  done
-  if [[ -d "$CODEX_DIR/skills/persona-council" && -f "$CODEX_DIR/skills/persona-council/.persona-team-managed" ]]; then
-    mv "$CODEX_DIR/skills/persona-council" "$BACKUP_DIR/persona-council.uninstall.$(timestamp).$$"
+  local current_model current_effort last_model last_effort original_model original_effort restore_model restore_effort
+  local shell_rc bin file confirmation="" count size transaction uninstall_status
+  require_macos
+  validate_local_layout
+  if [[ $# -eq 2 && "$1" == "--confirm" ]]; then
+    confirmation="$2"
+  elif [[ $# -ne 0 ]]; then
+    die "사용법: persona uninstall [--confirm DELETE-PERSONA-DATA]"
   fi
+
+  if find "$PERSONA_ROOT" -type l -print -quit 2>/dev/null | grep -q .; then
+    die "Persona 전용 로컬 데이터 안에 심볼릭 링크가 있어 아무것도 삭제하지 않았습니다."
+  fi
+  if [[ -f "$CODEX_DIR/AGENTS.md" ]] && ! strip_managed_block "$CODEX_DIR/AGENTS.md" "$AGENTS_START" "$AGENTS_END" >/dev/null; then
+    die "전역 AGENTS 관리 마커가 손상되어 아무것도 삭제하지 않았습니다."
+  fi
+  for file in "$CODEX_DIR/agents/soul.toml" "$CODEX_DIR/agents/core.toml"; do
+    if [[ -e "$file" ]] && { [[ ! -f "$file" ]] || ! grep -Fq "$MANAGED_AGENT_MARKER" "$file"; }; then
+      die "관리 파일 식별자가 일치하지 않아 아무것도 삭제하지 않았습니다: $file"
+    fi
+  done
+  if [[ -e "$CODEX_DIR/skills/persona-council" ]] && \
+    { [[ ! -d "$CODEX_DIR/skills/persona-council" ]] || [[ ! -f "$CODEX_DIR/skills/persona-council/.persona-team-managed" ]]; }; then
+    die "관리 스킬 식별자가 일치하지 않아 아무것도 삭제하지 않았습니다."
+  fi
+  bin="$(state_get bin_dir 2>/dev/null || persona_bin_dir)"
+  if [[ -e "$bin/persona" ]] && { [[ ! -f "$bin/persona" ]] || ! grep -Fq "$LAUNCHER_MARKER" "$bin/persona"; }; then
+    die "관리 명령 식별자가 일치하지 않아 아무것도 삭제하지 않았습니다: $bin/persona"
+  fi
+  shell_rc="$(state_get shell_rc 2>/dev/null || true)"
+  if [[ -n "$shell_rc" && -f "$shell_rc" ]] && ! strip_managed_block "$shell_rc" "$PATH_START" "$PATH_END" >/dev/null; then
+    die "셸 PATH 관리 마커가 손상되어 아무것도 삭제하지 않았습니다: $shell_rc"
+  fi
+
+  count="$(find "$PERSONA_ROOT" -type f -print | wc -l | tr -d ' ')"
+  size="$(du -sh "$PERSONA_ROOT" 2>/dev/null | awk '{print $1}')"
+  printf '영구 삭제 대상: %s\n파일 수: %s\n크기: %s\n' "$PERSONA_ROOT" "$count" "${size:-unknown}"
+  printf '보존: Persona 소스 저장소, 각 프로젝트의 docs/persona, Git 자격 증명, Codex 자체 기억과 기존 작업\n'
+  if [[ -z "$confirmation" ]]; then
+    [[ -t 0 && -r /dev/tty ]] || die "대화형 터미널이 아닙니다. --confirm DELETE-PERSONA-DATA가 필요합니다."
+    printf '계속하려면 DELETE-PERSONA-DATA를 정확히 입력하세요: '
+    IFS= read -r confirmation </dev/tty
+  fi
+  [[ "$confirmation" == "DELETE-PERSONA-DATA" ]] || die "확인 문구가 일치하지 않아 아무것도 삭제하지 않았습니다."
+
   current_model="$(toml_root_get "$CODEX_DIR/config.toml" model 2>/dev/null || printf '%s' __missing__)"
   current_effort="$(toml_root_get "$CODEX_DIR/config.toml" model_reasoning_effort 2>/dev/null || printf '%s' __missing__)"
   last_model="$(state_get last_written_loop_model 2>/dev/null || printf '%s' __unknown__)"
@@ -1014,14 +1732,46 @@ command_uninstall() {
   restore_effort="$current_effort"
   if [[ "$current_model" == "$last_model" ]]; then restore_model="$original_model"; else warn "Loop 모델이 설치 후 변경되어 현재 값을 보존했습니다."; fi
   if [[ "$current_effort" == "$last_effort" ]]; then restore_effort="$original_effort"; else warn "Loop 추론 강도가 설치 후 변경되어 현재 값을 보존했습니다."; fi
-  write_config_pair "$restore_model" "$restore_effort"
-  info "변경되지 않은 Loop 기본 설정을 설치 전 값으로 복원했습니다."
-  shell_rc="$(state_get shell_rc 2>/dev/null || true)"
-  if [[ -n "$shell_rc" ]]; then remove_block_from_file "$shell_rc" "$PATH_START" "$PATH_END"; fi
-  bin="$(state_get bin_dir 2>/dev/null || persona_bin_dir)"
-  if [[ -f "$bin/persona" ]] && grep -Fq "$LAUNCHER_MARKER" "$bin/persona"; then rm -f "$bin/persona"; fi
-  state_set installed false
-  info "전역 설치를 제거했습니다. 저장소, 기억과 백업은 보존했습니다."
+
+  transaction="$(mktemp -d "${TMPDIR:-/tmp}/persona-uninstall.XXXXXX")"
+  chmod 700 "$transaction"
+  snapshot_install_target "$transaction" local_root "$PERSONA_ROOT"
+  snapshot_install_target "$transaction" config "$CODEX_DIR/config.toml"
+  snapshot_install_target "$transaction" agents "$CODEX_DIR/AGENTS.md"
+  snapshot_install_target "$transaction" soul "$CODEX_DIR/agents/soul.toml"
+  snapshot_install_target "$transaction" core "$CODEX_DIR/agents/core.toml"
+  snapshot_install_target "$transaction" skill "$CODEX_DIR/skills/persona-council"
+  snapshot_install_target "$transaction" launcher "$bin/persona"
+  if [[ -n "$shell_rc" ]]; then snapshot_install_target "$transaction" shell_rc "$shell_rc"; fi
+
+  set +e
+  (
+    set -e
+    remove_block_from_file "$CODEX_DIR/AGENTS.md" "$AGENTS_START" "$AGENTS_END"
+    for file in "$CODEX_DIR/agents/soul.toml" "$CODEX_DIR/agents/core.toml"; do [[ ! -e "$file" ]] || rm -f -- "$file"; done
+    if [[ -d "$CODEX_DIR/skills/persona-council" ]]; then rm -rf -- "$CODEX_DIR/skills/persona-council"; fi
+    write_config_pair "$restore_model" "$restore_effort"
+    if [[ -n "$shell_rc" ]]; then remove_block_from_file "$shell_rc" "$PATH_START" "$PATH_END"; fi
+    if [[ -f "$bin/persona" ]]; then rm -f -- "$bin/persona"; fi
+    rm -rf -- "$PERSONA_ROOT"
+  )
+  uninstall_status=$?
+  set -e
+  if (( uninstall_status != 0 )); then
+    restore_install_target "$transaction" local_root "$PERSONA_ROOT"
+    restore_install_target "$transaction" config "$CODEX_DIR/config.toml"
+    restore_install_target "$transaction" agents "$CODEX_DIR/AGENTS.md"
+    restore_install_target "$transaction" soul "$CODEX_DIR/agents/soul.toml"
+    restore_install_target "$transaction" core "$CODEX_DIR/agents/core.toml"
+    restore_install_target "$transaction" skill "$CODEX_DIR/skills/persona-council"
+    restore_install_target "$transaction" launcher "$bin/persona"
+    if [[ -n "$shell_rc" ]]; then restore_install_target "$transaction" shell_rc "$shell_rc"; fi
+    rm -rf -- "$transaction"
+    die "제거 중 오류가 발생해 설치와 로컬 데이터를 이전 상태로 복구했습니다."
+  fi
+  rm -rf -- "$transaction"
+  info "Persona 전역 설치와 전용 로컬 데이터 ${count}개를 영구 삭제했습니다. 이 데이터는 Persona 백업에서도 복구할 수 없습니다."
+  info "Persona 소스 저장소, 프로젝트 문서, Codex 자체 기억과 기존 작업은 보존했습니다."
 }
 
 usage() {
@@ -1034,29 +1784,49 @@ Usage:
   persona model reset loop|soul|core
   persona status
   persona doctor
-  persona project use <slug>
+  persona update
+  persona project init [--name <name>]
+  persona project status|validate
+  persona project index --approved
+  persona team bind|status|cursor|clear ...
+  persona handoff add|list|clear ...
+  persona meeting draft|list|publish|clear ...
+  persona writer acquire|status|release|recover ...
   persona context loop|soul|core
-  persona memory add ... --approved
+  persona memory add --scope global ... --approved
   persona memory retract <id> --approved
-  persona sync
-  persona uninstall
+  persona memory status
+  persona uninstall [--confirm DELETE-PERSONA-DATA]
 EOF
+}
+
+ensure_installed() {
+  validate_local_layout
+  [[ "$(state_get installed 2>/dev/null || true)" == "true" ]] || die "Persona Team이 설치되어 있지 않습니다."
+  cleanup_expired_pending
+  chmod_private_tree
 }
 
 main() {
   local command="${1:-help}"
   shift || true
+  case "$command" in help|-h|--help|version|--version) ;; *) require_macos ;; esac
   case "$command" in
     __install) command_install "$@" ;;
-    profile) command_profile "$@" ;;
-    model) command_model "$@" ;;
-    status) command_status "$@" ;;
+    profile) ensure_installed; command_profile "$@" ;;
+    model) ensure_installed; command_model "$@" ;;
+    status) ensure_installed; command_status "$@" ;;
     doctor) command_doctor "$@" ;;
-    project) command_project "$@" ;;
-    context) command_context "$@" ;;
-    memory) command_memory "$@" ;;
+    update) [[ $# -eq 0 ]] || die "사용법: persona update"; command_update ;;
+    project) ensure_installed; command_project "$@" ;;
+    team) ensure_installed; command_team "$@" ;;
+    handoff) ensure_installed; command_handoff "$@" ;;
+    meeting) ensure_installed; command_meeting "$@" ;;
+    writer) ensure_installed; command_writer "$@" ;;
+    context) ensure_installed; command_context "$@" ;;
+    memory) ensure_installed; command_memory "$@" ;;
     sync) [[ $# -eq 0 ]] || die "사용법: persona sync"; command_sync ;;
-    uninstall) [[ $# -eq 0 ]] || die "사용법: persona uninstall"; command_uninstall ;;
+    uninstall) command_uninstall "$@" ;;
     help|-h|--help) usage ;;
     version|--version) printf '%s\n' "$PERSONA_VERSION" ;;
     *) usage >&2; die "알 수 없는 명령입니다: $command" ;;

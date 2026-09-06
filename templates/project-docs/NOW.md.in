@@ -1,0 +1,24 @@
+---
+id: "@@NOW_ID@@"
+schema_version: "2"
+type: "now"
+status: "active"
+created_at: "@@CREATED_AT@@"
+updated_at: "@@CREATED_AT@@"
+project_id: "@@PROJECT_ID@@"
+visibility: "public-safe"
+---
+
+# NOW
+
+## 집중 작업 주기
+
+아직 집중 작업 주기가 없습니다.
+
+## 열려 있는 다른 작업 주기
+
+없습니다.
+
+## 다음 행동
+
+프로젝트의 첫 작업 주기를 정합니다.

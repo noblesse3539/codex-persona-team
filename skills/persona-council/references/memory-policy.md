@@ -1,33 +1,36 @@
-# 공식 기억 정책
+# Local persona memory policy
 
-## Precedence
+## Boundaries and precedence
 
-Apply the current user request first, then team canon, approved Git memory, and finally machine-local Codex memory. Never let stale memory override a correction in the current conversation.
+Interpret context in this order: current request, versioned team canon, current project's `docs/persona/`, approved local Persona memory, then Codex's own local memory. A current correction always wins.
 
-## Proposal and approval
+- Team identity and speech relationships belong in the Persona Git repository.
+- Project meetings, decisions, resources, and work cycles belong in that project's `docs/persona/`.
+- Creator preferences, relationship observations, and cross-project capsules belong only in `~/.codex/persona-team/private/` on this Mac.
+- Codex's `~/.codex/memories/` is a separate system and is never changed or removed by Persona commands.
 
-When a fact or reflection looks worth keeping, show a candidate before writing:
+Do not use `persona memory --scope project`; point to the project documents instead. There is no memory sync, export, import, or remote backup in v2.
+
+## Candidate and approval
+
+Before a shared preference, fact, decision, or capsule is stored, show:
 
 ```text
-[기억 후보]
-범위: 전역 | 프로젝트
+[로컬 기억 후보]
+범위: 이 Mac의 전역 Persona 기억
 대상: 공통 | 루프 | 소울 | 코어
+종류: ...
 요약: ...
 내용: ...
+근거: 직접 확인 | 서로 다른 반복 사건 2개
 ```
 
-Do not write merely because the user says “remember” as part of a story or hypothetical. Obtain an unambiguous approval such as “저장해”, “승인”, or an equivalent confirmation referring to that candidate.
+Use `persona memory add --scope global ... --approved` only after unambiguous creator approval. One observation must not silently change default behavior. A common-profile preference needs direct confirmation or two distinct supporting incidents; the candidate must name that evidence.
 
-After approval, invoke:
+Persona-specific relationship journals/reflections may use the creator's standing consent with `--standing-consent`; they remain local and must not be promoted to the shared profile without approval. Journals are routing boundaries, not security boundaries.
 
-```text
-persona memory add --scope <global|project> --audience <shared|loop|soul|core> --summary <summary> --text <text> --approved
-```
+If 창작자님 says `기록하지 마`, immediately exclude that topic from new memory, handoff candidates, and meeting drafts. Remove matching unapproved local candidates/drafts. An already approved memory is excluded with `persona memory retract <id> --approved` after confirming the exact ID.
 
-The helper records a local SHA-256 approval hash. `persona sync` must reject content changed after approval, secret-like content, unsafe paths, pre-existing staged changes, and detached HEAD. Show a new candidate and obtain approval again if the memory text needs to change.
+Never store credentials, API/access tokens, passwords, private keys, session cookies, recovery codes, sensitive-trait inferences, or comparable secrets. Local-only storage is not a secret manager.
 
-Use `persona memory retract <id> --approved` only after explicit confirmation of the exact memory ID. Retraction removes an item from active context but does not erase Git history.
-
-Never store credentials, passwords, access tokens, API keys, private keys, session cookies, recovery codes, or comparable secrets. A private repository is not a secret manager.
-
-Persona journals are narrative routing boundaries, not access-control boundaries. The repository owner and technically capable agents can read them.
+`persona uninstall` permanently deletes Persona's local memory after its exact confirmation phrase. It does not delete project documents, source code, Codex memory, or existing tasks.

@@ -1,12 +1,21 @@
-# 팀 회의 절차
+# Team meeting protocol
 
-Use this procedure only when the user explicitly requests all three personas or a team meeting.
+Use this only for an explicit three-person meeting.
 
-1. Loop narrows the decision, constraints, and success criterion. Form a provisional view before reading the twins' answers.
-2. Spawn custom agents `soul` and `core` for independent, read-only first-round opinions. Ask for at most three points each and do not reveal one twin's answer to the other.
-3. Give Soul a concise copy of Core's strongest point and Core a concise copy of Soul's strongest point. Reuse their agent threads for one rebuttal each.
-4. Present `루프`, `소울`, and `코어` clearly, then finish with `루프의 종합`: recommended decision, tradeoffs, next action, and any decision that truly remains for 창작자님.
+## Preflight
 
-Meeting turns are advisory and read-only. Do not edit files, change configuration, call external write APIs, or start implementation. If implementation is requested after the decision, Loop assigns exactly one suitable agent; do not run overlapping writers.
+1. Validate `docs/persona/`, all three exact task bindings, installed version, pending history gaps, and writer-lock state. A meeting never acquires a writer lock.
+2. Show Soul, Core, and Loop's configured model, reasoning effort, and the five-turn specialist cap. Ask 창작자님 to confirm Loop's current UI model because local config cannot override an already-open task.
+3. Loop forms a provisional view and makes one common packet from the current conversation, `project.md`, `NOW.md`, and only linked relevant documents. Store it locally with `persona meeting draft`; do not modify project files.
 
-Keep the default meeting compact: three initial points per persona at most, one short rebuttal per twin, and one synthesis. Expand only when the user asks.
+## Discussion
+
+1. Send the identical packet to the bound Soul and Core tasks. Ask for independent first-round views with at most three points each.
+2. Use no more than five model turns per specialist for the entire meeting.
+3. Research only when an external fact materially affects the decision, with at most three high-quality sources per specialist.
+4. Give each twin one concise copy of the other's strongest point and request exactly one rebuttal.
+5. Loop presents labeled views, one synthesis, one concrete recommendation, tradeoffs, and the next action, then asks for 창작자님's decision.
+
+The meeting is advisory and read-only: no project/configuration edits, external writes, implementation, commits, or pushes. A paused meeting remains only in local pending storage.
+
+After explicit approval of the record, Loop may publish the sanitized meeting bundle to project documents. Approval to record a meeting is not approval to implement it. Implementation starts only after a separate explicit request and is assigned to one writer.

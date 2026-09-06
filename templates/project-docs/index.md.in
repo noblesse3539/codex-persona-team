@@ -1,0 +1,17 @@
+---
+id: "@@INDEX_ID@@"
+schema_version: "2"
+type: "generated-index"
+status: "active"
+created_at: "@@CREATED_AT@@"
+updated_at: "@@CREATED_AT@@"
+project_id: "@@PROJECT_ID@@"
+visibility: "public-safe"
+generated: true
+---
+
+# @@INDEX_TITLE@@
+
+<!-- PERSONA-GENERATED:START -->
+아직 기록이 없습니다.
+<!-- PERSONA-GENERATED:END -->

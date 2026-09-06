@@ -3,3 +3,7 @@ Thumbs.db
 *.tmp
 *.bak
 .persona-test/
+/memory/
+/.persona-docs-init.*
+/.persona-meeting-apply.*
+/.persona-meeting-backup.*
